@@ -4,12 +4,14 @@ from ...invoice.models import Invoice
 from ..core.dataloaders import DataLoader
 
 
-class InvoicesByOrderIdLoader(DataLoader):
+class InvoicesByOrderIdLoader(DataLoader[int, list[Invoice]]):
     context_key = "invoices_by_order_id"
 
     def batch_load(self, keys):
-        invoices = Invoice.objects.using(self.database_connection_name).filter(
-            order_id__in=keys
+        invoices = (
+            Invoice.objects.using(self.database_connection_name)
+            .filter(order_id__in=keys)
+            .order_by("pk")
         )
         invoices_by_order_map = defaultdict(list)
         for invoice in invoices:

@@ -24,7 +24,12 @@ class TranslationErrorCode(Enum):
     INVALID = "invalid"
     NOT_FOUND = "not_found"
     REQUIRED = "required"
+    UNIQUE = "unique"
 
 
 class UploadErrorCode(Enum):
+    GRAPHQL_ERROR = "graphql_error"
+
+
+class CoreErrorCode(Enum):
     GRAPHQL_ERROR = "graphql_error"

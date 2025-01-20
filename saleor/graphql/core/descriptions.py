@@ -6,20 +6,22 @@ DEPRECATED_IN_3X_FIELD = "This field will be removed in Saleor 4.0."
 # deprecation message needs to be included in the field description.
 DEPRECATED_IN_3X_INPUT = "\n\nDEPRECATED: this field will be removed in Saleor 4.0."
 
+# Deprecation message for enum values.
+DEPRECATED_IN_3X_ENUM_VALUE = (
+    "\n\nDEPRECATED: this value will be removed in Saleor 4.0."
+)
 
 DEPRECATED_IN_3X_MUTATION = (
     "\n\nDEPRECATED: this mutation will be removed in Saleor 4.0."
 )
+DEPRECATED_IN_3X_TYPE = "\n\nDEPRECATED: this type will be removed in Saleor 4.0."
 
-ADDED_IN_31 = "\n\nAdded in Saleor 3.1."
-ADDED_IN_32 = "\n\nAdded in Saleor 3.2."
-ADDED_IN_33 = "\n\nAdded in Saleor 3.3."
-ADDED_IN_34 = "\n\nAdded in Saleor 3.4."
-ADDED_IN_35 = "\n\nAdded in Saleor 3.5."
-ADDED_IN_36 = "\n\nAdded in Saleor 3.6."
-ADDED_IN_37 = "\n\nAdded in Saleor 3.7."
-ADDED_IN_38 = "\n\nAdded in Saleor 3.8."
-ADDED_IN_39 = "\n\nAdded in Saleor 3.9."
+DEPRECATED_IN_3X_EVENT = "\n\nDEPRECATED: this event will be removed in Saleor 4.0."
+
+ADDED_IN_318 = "\n\nAdded in Saleor 3.18."
+ADDED_IN_319 = "\n\nAdded in Saleor 3.19."
+ADDED_IN_320 = "\n\nAdded in Saleor 3.20."
+ADDED_IN_321 = "\n\nAdded in Saleor 3.21."
 
 
 PREVIEW_FEATURE = (

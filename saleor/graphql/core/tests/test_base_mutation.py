@@ -3,13 +3,12 @@ from unittest import mock
 import graphene
 import pytest
 from django.core.exceptions import ImproperlyConfigured
-from django.utils.functional import SimpleLazyObject
-from graphql import GraphQLError
-from graphql.execution import ExecutionResult
+from freezegun import freeze_time
 
-from ....core.permissions import ProductPermissions
+from ....core.jwt import create_access_token
+from ....graphql.tests.utils import get_graphql_content
 from ....order.models import Order
-from ....plugins.tests.sample_plugins import PluginSample
+from ....permission.enums import ProductPermissions
 from ....product.models import Product
 from ...order import types as order_types
 from ...product import types as product_types
@@ -47,7 +46,7 @@ class MutationWithCustomErrors(Mutation):
 
 
 class RestrictedMutation(Mutation):
-    """A mutation requiring the user to have given permissions"""
+    """A mutation requiring the user to have certain permissions."""
 
     auth_token = graphene.types.String(
         description="The newly created authentication token."
@@ -145,7 +144,7 @@ def test_user_error_nonexistent_id(schema_context, channel_USD):
     user_errors = result.data["test"]["errors"]
     assert user_errors
     assert user_errors[0]["field"] == "productId"
-    assert user_errors[0]["message"] == "Couldn't resolve id: not-really."
+    assert user_errors[0]["message"] == "Invalid ID: not-really. Expected: Product."
 
 
 TEST_ORDER_MUTATION = """
@@ -162,8 +161,6 @@ TEST_ORDER_MUTATION = """
 
 
 def test_order_mutation_resolve_uuid_id(order, schema_context, channel_USD):
-    """Ensure that order migrations can be perfromed with use of
-    new order id (uuid type)."""
     order_id = graphene.Node.to_global_id("Order", order.pk)
     variables = {"id": order_id, "channel": channel_USD.slug}
     result = schema.execute(
@@ -174,8 +171,6 @@ def test_order_mutation_resolve_uuid_id(order, schema_context, channel_USD):
 
 
 def test_order_mutation_for_old_int_id(order, schema_context, channel_USD):
-    """Ensure that order migrations for orders with `use_old_id` flag set to True,
-    can be perfromed with use of old order id (int type)."""
     order.use_old_id = True
     order.save(update_fields=["use_old_id"])
 
@@ -226,149 +221,16 @@ def test_user_error_id_of_different_type(product, schema_context, channel_USD):
     user_errors = result.data["test"]["errors"]
     assert user_errors
     assert user_errors[0]["field"] == "productId"
-    assert user_errors[0]["message"] == "Must receive a Product id."
+    assert (
+        user_errors[0]["message"]
+        == f"Invalid ID: {variant_id}. Expected: Product, received: ProductVariant."
+    )
 
 
 def test_get_node_or_error_returns_null_for_empty_id():
     info = mock.Mock()
     response = Mutation.get_node_or_error(info, "", field="")
     assert response is None
-
-
-def test_mutation_plugin_perform_mutation_handles_graphql_error(
-    request,
-    settings,
-    plugin_configuration,
-    product,
-    channel_USD,
-):
-    """Ensure when the mutation calls the method 'perform_mutation' on plugins,
-    the returned error "GraphQLError" is properly returned and transformed into a dict
-    """
-    settings.PLUGINS = [
-        "saleor.plugins.tests.sample_plugins.PluginSample",
-    ]
-
-    schema_context = request.getfixturevalue("schema_context")
-
-    product_id = graphene.Node.to_global_id("Product", product.pk)
-    variables = {"productId": product_id, "channel": channel_USD.slug}
-
-    with mock.patch.object(
-        PluginSample,
-        "perform_mutation",
-        return_value=GraphQLError("My Custom Error"),
-    ):
-        result = schema.execute(
-            TEST_MUTATION, variables=variables, context_value=schema_context
-        )
-    assert result.to_dict() == {
-        "data": {"test": None},
-        "errors": [
-            {
-                "locations": [{"column": 9, "line": 3}],
-                "message": "My Custom Error",
-                "path": ["test"],
-            }
-        ],
-    }
-
-
-def test_mutation_plugin_perform_mutation_handles_custom_execution_result(
-    request,
-    settings,
-    plugin_configuration,
-    product,
-    channel_USD,
-):
-    """Ensure when the mutation calls the method 'perform_mutation' on plugins,
-    if a "ExecutionResult" object is returned, then the GraphQL response contains it
-    """
-    settings.PLUGINS = [
-        "saleor.plugins.tests.sample_plugins.PluginSample",
-    ]
-
-    schema_context = request.getfixturevalue("schema_context")
-
-    product_id = graphene.Node.to_global_id("Product", product.pk)
-    variables = {"productId": product_id, "channel": channel_USD.slug}
-
-    with mock.patch.object(
-        PluginSample,
-        "perform_mutation",
-        return_value=ExecutionResult(data={}, errors=[GraphQLError("My Custom Error")]),
-    ):
-        result = schema.execute(
-            TEST_MUTATION, variables=variables, context_value=schema_context
-        )
-    assert result.to_dict() == {
-        "data": {"test": None},
-        "errors": [
-            {
-                "locations": [{"column": 13, "line": 5}],
-                "message": "My Custom Error",
-                "path": ["test", "errors", 0],
-            }
-        ],
-    }
-
-
-@mock.patch.object(
-    PluginSample,
-    "perform_mutation",
-    return_value=ExecutionResult(data={}, errors=[GraphQLError("My Custom Error")]),
-)
-def test_mutation_calls_plugin_perform_mutation_after_permission_checks(
-    mocked_plugin,
-    request,
-    settings,
-    staff_user,
-    plugin_configuration,
-    product,
-    channel_USD,
-    permission_manage_products,
-):
-    """
-    Ensure the mutation calls the method 'perform_mutation' on plugins only once the
-    user/app permissions are verified
-    """
-    mutation_query = """
-        mutation testRestrictedMutation($productId: ID!, $channel: String) {
-            restrictedMutation(productId: $productId, channel: $channel) {
-                name
-                errors {
-                    field
-                    message
-                }
-            }
-        }
-    """
-
-    settings.PLUGINS = [
-        "saleor.plugins.tests.sample_plugins.PluginSample",
-    ]
-
-    schema_context = request.getfixturevalue("schema_context")
-    schema_context.user = SimpleLazyObject(lambda: staff_user)
-
-    product_id = graphene.Node.to_global_id("Product", product.pk)
-    variables = {"productId": product_id, "channel": channel_USD.slug}
-
-    # When permission is missing, it should not return the custom error from plugin
-    result = schema.execute(
-        mutation_query, variables=variables, context_value=schema_context
-    )
-    assert len(result.errors) == 1, result.to_dict()
-    assert "You need one of the following permissions" in result.errors[0].message
-
-    # When permission is not missing, the execution of the plugin should happen
-    staff_user.user_permissions.set([permission_manage_products])
-    del staff_user._perm_cache  # force django to re-fetch permissions
-    result = schema.execute(
-        mutation_query, variables=variables, context_value=schema_context
-    )
-    assert len(result.errors) == 1, result.to_dict()
-    assert result.errors[0].message == "My Custom Error"
 
 
 def test_base_mutation_get_node_by_pk_with_order_qs_and_old_int_id(order):
@@ -419,3 +281,36 @@ def test_base_mutation_get_node_by_pk_with_qs_for_product(product):
 
     # then
     assert node.id == product.id
+
+
+def test_expired_token_error(user_api_client, channel_USD):
+    # given
+    user = user_api_client.user
+    with freeze_time("2023-01-01 12:00:00"):
+        expired_access_token = create_access_token(user)
+        user_api_client.token = expired_access_token
+
+    mutation = """
+      mutation createCheckout($checkoutInput: CheckoutCreateInput!) {
+        checkoutCreate(input: $checkoutInput) {
+          checkout {
+            id
+          }
+          errors {
+            field
+            message
+            code
+          }
+        }
+      }
+    """
+
+    # when
+    variables = {"checkoutInput": {"channel": channel_USD.slug, "lines": []}}
+    response = user_api_client.post_graphql(mutation, variables)
+    content = get_graphql_content(response, ignore_errors=True)
+
+    # then
+    error = content["errors"][0]
+    assert error["message"] == "Signature has expired"
+    assert error["extensions"]["exception"]["code"] == "ExpiredSignatureError"

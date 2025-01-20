@@ -2,7 +2,6 @@ import datetime
 from unittest.mock import patch
 
 import graphene
-import pytz
 from django.utils import timezone
 from freezegun import freeze_time
 
@@ -203,10 +202,10 @@ def test_product_channel_listing_update_as_staff_user(
     staff_api_client, product, permission_manage_products, channel_USD, channel_PLN
 ):
     # given
-    publication_date = datetime.datetime.now(pytz.utc).replace(microsecond=0)
+    publication_date = datetime.datetime.now(tz=datetime.UTC).replace(microsecond=0)
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_PLN.id)
-    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=pytz.utc)
+    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=datetime.UTC)
     variables = {
         "id": product_id,
         "input": {
@@ -281,10 +280,10 @@ def test_product_channel_listing_update_trigger_webhook_product_updated(
     channel_USD,
 ):
     # given
-    publication_date = datetime.datetime.now(pytz.utc)
+    publication_date = datetime.datetime.now(tz=datetime.UTC)
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
-    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=pytz.utc)
+    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=datetime.UTC)
     variables = {
         "id": product_id,
         "input": {
@@ -321,10 +320,10 @@ def test_product_channel_listing_update_as_app(
     app_api_client, product, permission_manage_products, channel_USD, channel_PLN
 ):
     # given
-    publication_date = datetime.datetime.now(pytz.utc).replace(microsecond=0)
+    publication_date = datetime.datetime.now(tz=datetime.UTC).replace(microsecond=0)
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_PLN.id)
-    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=pytz.utc)
+    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=datetime.UTC)
     variables = {
         "id": product_id,
         "input": {
@@ -419,10 +418,10 @@ def test_product_channel_listing_update_add_channel(
     staff_api_client, product, permission_manage_products, channel_USD, channel_PLN
 ):
     # given
-    publication_date = datetime.datetime.now(pytz.utc).replace(microsecond=0)
+    publication_date = datetime.datetime.now(tz=datetime.UTC).replace(microsecond=0)
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_PLN.id)
-    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=pytz.utc)
+    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=datetime.UTC)
     variables = {
         "id": product_id,
         "input": {
@@ -499,12 +498,13 @@ def test_product_channel_listing_update_add_channel_without_publication_date(
     assert product_data["channelListings"][0]["channel"]["slug"] == channel_USD.slug
     assert product_data["channelListings"][1]["isPublished"] is True
     assert (
-        datetime.date(2020, 3, 18).isoformat()
-        in product_data["channelListings"][1]["publishedAt"]
+        datetime.datetime.now(tz=datetime.UTC).isoformat()
+        == product_data["channelListings"][1]["publishedAt"]
     )
     assert product_data["channelListings"][1]["channel"]["slug"] == channel_PLN.slug
 
 
+@freeze_time("2023-11-13T14:53:59.655366")
 def test_product_channel_listing_update_unpublished(
     staff_api_client, product, permission_manage_products, channel_USD
 ):
@@ -532,8 +532,8 @@ def test_product_channel_listing_update_unpublished(
     assert product_data["slug"] == product.slug
     assert product_data["channelListings"][0]["isPublished"] is False
     assert (
-        datetime.date.today().isoformat()
-        in product_data["channelListings"][0]["publishedAt"]
+        datetime.datetime.now(tz=datetime.UTC).isoformat()
+        == product_data["channelListings"][0]["publishedAt"]
     )
     assert product_data["channelListings"][0]["channel"]["slug"] == channel_USD.slug
     assert product_data["channelListings"][0]["visibleInListings"] is True
@@ -572,8 +572,8 @@ def test_product_channel_listing_update_publish_without_publication_date(
     assert product_data["slug"] == product.slug
     assert product_data["channelListings"][0]["isPublished"] is True
     assert (
-        datetime.date(2020, 3, 18).isoformat()
-        in product_data["channelListings"][0]["publishedAt"]
+        datetime.datetime.now(tz=datetime.UTC).isoformat()
+        == product_data["channelListings"][0]["publishedAt"]
     )
     assert product_data["channelListings"][0]["channel"]["slug"] == channel_USD.slug
 
@@ -655,7 +655,7 @@ def test_product_channel_listing_update_update_publication_data(
     staff_api_client, product, permission_manage_products, channel_USD
 ):
     # given
-    publication_date = datetime.datetime.now(pytz.utc).replace(microsecond=0)
+    publication_date = datetime.datetime.now(tz=datetime.UTC).replace(microsecond=0)
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
     variables = {
@@ -734,6 +734,7 @@ def test_product_channel_listing_update_update_is_available_for_purchase_false(
     assert not product_data["channelListings"][0]["availableForPurchaseAt"]
 
 
+@freeze_time("2023-11-13T14:53:59.655366")
 def test_product_channel_listing_update_update_is_available_for_purchase_without_date(
     staff_api_client, product, permission_manage_products, channel_USD
 ):
@@ -768,18 +769,19 @@ def test_product_channel_listing_update_update_is_available_for_purchase_without
     assert product_data["channelListings"][0]["visibleInListings"] is True
     assert product_data["channelListings"][0]["isAvailableForPurchase"] is True
     assert (
-        datetime.date.today().isoformat()
-        in product_data["channelListings"][0]["availableForPurchaseAt"]
+        datetime.datetime.now(tz=datetime.UTC).isoformat()
+        == product_data["channelListings"][0]["availableForPurchaseAt"]
     )
 
 
+@freeze_time("2023-11-13T14:53:59.655366")
 def test_product_channel_listing_update_update_is_available_for_purchase_past_date(
     staff_api_client, product, permission_manage_products, channel_USD
 ):
     # given
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
-    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=pytz.utc)
+    available_for_purchase_date = datetime.datetime(2007, 1, 1, tzinfo=datetime.UTC)
     variables = {
         "id": product_id,
         "input": {
@@ -817,13 +819,14 @@ def test_product_channel_listing_update_update_is_available_for_purchase_past_da
     )
 
 
+@freeze_time("2023-11-13T14:53:59.655366")
 def test_product_channel_listing_update_update_is_available_for_purchase_future_date(
     staff_api_client, product, permission_manage_products, channel_USD
 ):
     # given
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
-    available_for_purchase_date = datetime.datetime.now(pytz.utc).replace(
+    available_for_purchase_date = datetime.datetime.now(tz=datetime.UTC).replace(
         microsecond=0
     ) + datetime.timedelta(days=1)
     variables = {
@@ -863,15 +866,16 @@ def test_product_channel_listing_update_update_is_available_for_purchase_future_
     )
 
 
+@freeze_time("2023-11-13T14:53:59.655366")
 def test_product_channel_listing_update_update_is_available_for_purchase_false_and_date(
     staff_api_client, product, permission_manage_products, channel_USD
 ):
     # given
     product_id = graphene.Node.to_global_id("Product", product.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
-    available_for_purchase_date = datetime.datetime.now(pytz.utc) + datetime.timedelta(
-        days=1
-    )
+    available_for_purchase_date = datetime.datetime.now(
+        datetime.UTC
+    ) + datetime.timedelta(days=1)
     variables = {
         "id": product_id,
         "input": {
@@ -939,7 +943,7 @@ def test_product_channel_listing_update_remove_channel(
     assert variant.channel_listings.get() == variant_channel_listing_pln
 
 
-def test_product_channel_listing_update_remove_channel_removes_checkout_lines(
+def test_product_channel_listing_update_remove_channel_dont_remove_checkout_lines(
     staff_api_client,
     product_available_in_many_channels,
     permission_manage_products,
@@ -950,7 +954,9 @@ def test_product_channel_listing_update_remove_channel_removes_checkout_lines(
     # given
     product = product_available_in_many_channels
     variant = product.variants.get()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
+    checkout_info = fetch_checkout_info(
+        checkout, [], get_plugins_manager(allow_replica=False)
+    )
     add_variant_to_checkout(checkout_info, variant, 1)
 
     assert checkout.lines.all().exists()
@@ -972,7 +978,7 @@ def test_product_channel_listing_update_remove_channel_removes_checkout_lines(
     # then
     data = content["data"]["productChannelListingUpdate"]
     assert not data["errors"]
-    assert not checkout.lines.all().exists()
+    assert checkout.lines.all().exists()
 
 
 def test_product_channel_listing_update_remove_not_assigned_channel(
@@ -1187,6 +1193,38 @@ def test_product_channel_listing_remove_variant_as_staff_user(
     assert len(variant.channel_listings.all()) == 1
 
 
+def test_product_channel_listing_remove_variant_is_None_as_staff_user(
+    staff_api_client, product, permission_manage_products, channel_USD, channel_PLN
+):
+    # given
+    variant = product.variants.first()
+    ProductVariantChannelListing.objects.create(channel=channel_PLN, variant=variant)
+
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": product_id,
+        "input": {
+            "updateChannels": [{"channelId": channel_id, "removeVariants": None}]
+        },
+    }
+
+    assert len(variant.channel_listings.all()) == 2
+    # when
+    response = staff_api_client.post_graphql(
+        PRODUCT_CHANNEL_LISTING_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_products,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["productChannelListingUpdate"]
+    assert not data["errors"]
+
+    assert len(variant.channel_listings.all()) == 2
+
+
 def test_product_channel_listing_remove_variant_as_app(
     app_api_client, product, permission_manage_products, channel_USD, channel_PLN
 ):
@@ -1222,7 +1260,39 @@ def test_product_channel_listing_remove_variant_as_app(
     assert len(variant.channel_listings.all()) == 1
 
 
-def test_product_channel_listing_remove_variant_removes_checkout_lines(
+def test_product_channel_listing_remove_variant_is_None_as_app(
+    app_api_client, product, permission_manage_products, channel_USD, channel_PLN
+):
+    # given
+    variant = product.variants.first()
+    ProductVariantChannelListing.objects.create(channel=channel_PLN, variant=variant)
+
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": product_id,
+        "input": {
+            "updateChannels": [{"channelId": channel_id, "removeVariants": None}]
+        },
+    }
+
+    assert len(variant.channel_listings.all()) == 2
+    # when
+    response = app_api_client.post_graphql(
+        PRODUCT_CHANNEL_LISTING_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_products,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["productChannelListingUpdate"]
+    assert not data["errors"]
+
+    assert len(variant.channel_listings.all()) == 2
+
+
+def test_product_channel_listing_remove_variant_do_not_removes_checkout_lines(
     staff_api_client,
     product,
     permission_manage_products,
@@ -1232,7 +1302,9 @@ def test_product_channel_listing_remove_variant_removes_checkout_lines(
 ):
     # given
     variant = product.variants.first()
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
+    checkout_info = fetch_checkout_info(
+        checkout, [], get_plugins_manager(allow_replica=False)
+    )
     add_variant_to_checkout(checkout_info, variant, 1)
 
     assert checkout.lines.all().exists()
@@ -1266,7 +1338,7 @@ def test_product_channel_listing_remove_variant_removes_checkout_lines(
 
     assert len(variant.channel_listings.all()) == 1
 
-    assert not checkout.lines.all().exists()
+    assert checkout.lines.all().exists()
 
 
 def test_product_channel_listing_add_variant_duplicated_ids_in_add_and_remove(

@@ -3,7 +3,6 @@ import uuid
 from decimal import Decimal
 
 import pytest
-import pytz
 from freezegun import freeze_time
 
 from ....product import ProductTypeKind
@@ -65,7 +64,7 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_USD,
                 is_published=True,
                 discounted_price_amount=Decimal(5),
-                published_at=datetime.datetime(2002, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2002, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=None,
             ),
             ProductChannelListing(
@@ -73,9 +72,9 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_USD,
                 is_published=True,
                 discounted_price_amount=Decimal(15),
-                published_at=datetime.datetime(2000, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2000, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=datetime.datetime(
-                    2003, 1, 1, tzinfo=pytz.UTC
+                    2003, 1, 1, tzinfo=datetime.UTC
                 ),
             ),
             ProductChannelListing(
@@ -83,9 +82,9 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_USD,
                 is_published=False,
                 discounted_price_amount=Decimal(4),
-                published_at=datetime.datetime(1999, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(1999, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=datetime.datetime(
-                    2000, 1, 1, tzinfo=pytz.UTC
+                    2000, 1, 1, tzinfo=datetime.UTC
                 ),
             ),
             ProductChannelListing(
@@ -94,9 +93,9 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 is_published=True,
                 visible_in_listings=True,
                 discounted_price_amount=Decimal(7),
-                published_at=datetime.datetime(2001, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2001, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=datetime.datetime(
-                    2001, 1, 1, tzinfo=pytz.UTC
+                    2001, 1, 1, tzinfo=datetime.UTC
                 ),
             ),
             # Second channel
@@ -105,9 +104,9 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_PLN,
                 is_published=False,
                 discounted_price_amount=Decimal(15),
-                published_at=datetime.datetime(2003, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2003, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=datetime.datetime(
-                    2003, 1, 1, tzinfo=pytz.UTC
+                    2003, 1, 1, tzinfo=datetime.UTC
                 ),
             ),
             ProductChannelListing(
@@ -115,9 +114,9 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_PLN,
                 is_published=True,
                 discounted_price_amount=Decimal(4),
-                published_at=datetime.datetime(1999, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(1999, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=datetime.datetime(
-                    2002, 1, 1, tzinfo=pytz.UTC
+                    2002, 1, 1, tzinfo=datetime.UTC
                 ),
             ),
             ProductChannelListing(
@@ -125,7 +124,7 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_PLN,
                 is_published=True,
                 discounted_price_amount=Decimal(5),
-                published_at=datetime.datetime(2000, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2000, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=None,
             ),
             ProductChannelListing(
@@ -134,9 +133,9 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 is_published=True,
                 visible_in_listings=True,
                 discounted_price_amount=Decimal(7),
-                published_at=datetime.datetime(1998, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(1998, 1, 1, tzinfo=datetime.UTC),
                 available_for_purchase_at=datetime.datetime(
-                    2000, 1, 1, tzinfo=pytz.UTC
+                    2000, 1, 1, tzinfo=datetime.UTC
                 ),
             ),
         ]
@@ -290,7 +289,7 @@ def test_products_with_sorting_and_without_channel(
 
 
 @pytest.mark.parametrize(
-    "sort_by, products_order",
+    ("sort_by", "products_order"),
     [
         (
             {"field": "PUBLISHED", "direction": "ASC"},
@@ -369,7 +368,7 @@ def test_products_with_sorting_and_channel_USD(
 
 
 @pytest.mark.parametrize(
-    "sort_by, products_order",
+    ("sort_by", "products_order"),
     [
         (
             {"field": "PUBLISHED", "direction": "ASC"},
@@ -532,7 +531,7 @@ def test_products_with_filtering_without_channel(
 
 
 @pytest.mark.parametrize(
-    "filter_by, products_count",
+    ("filter_by", "products_count"),
     [
         ({"isPublished": True}, 3),
         ({"isPublished": False}, 1),
@@ -577,7 +576,7 @@ def test_products_with_filtering_with_channel_USD(
 
 
 @pytest.mark.parametrize(
-    "filter_by, products_count",
+    ("filter_by", "products_count"),
     [
         ({"isPublished": True}, 3),
         ({"isPublished": False}, 1),
@@ -685,7 +684,7 @@ def test_published_products_without_sku_as_staff(
 
 
 @pytest.mark.parametrize(
-    "products_filter, count",
+    ("products_filter", "count"),
     [
         ({"updatedAt": {"gte": "2012-01-14T10:59:00+00:00"}}, 2),
         ({"updatedAt": {"lte": "2012-01-14T12:00:05+00:00"}}, 2),
@@ -754,7 +753,7 @@ query Variants($sortBy: ProductVariantSortingInput, $channel: String) {
 
 
 @pytest.mark.parametrize(
-    "sort_by, variants_order",
+    ("sort_by", "variants_order"),
     [
         (
             {"field": "LAST_MODIFIED_AT", "direction": "ASC"},
@@ -793,7 +792,7 @@ def test_products_variants_with_sorting_and_channel_USD(
 
 
 @pytest.mark.parametrize(
-    "sort_by, variants_order",
+    ("sort_by", "variants_order"),
     [
         (
             {"field": "LAST_MODIFIED_AT", "direction": "ASC"},

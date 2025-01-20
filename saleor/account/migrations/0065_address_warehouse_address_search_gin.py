@@ -5,12 +5,12 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("account", "0064_rewrite_customerevent_order_relation"),
     ]
 
     operations = [
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="address",
             index=django.contrib.postgres.indexes.GinIndex(

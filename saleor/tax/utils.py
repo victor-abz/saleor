@@ -1,39 +1,24 @@
+import logging
+from collections.abc import Iterable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
+from django.conf import settings
 from prices import TaxedMoney
 
+from ..core.prices import MAXIMUM_PRICE
+from ..core.taxes import TaxData, TaxDataError, TaxDataErrorMessage
+from ..core.utils.country import get_active_country
+from . import TaxCalculationStrategy
+
 if TYPE_CHECKING:
-    from ..account.models import Address
-    from ..channel.models import Channel
     from ..checkout.fetch import CheckoutInfo, CheckoutLineInfo
     from ..order.models import Order
     from ..tax.models import TaxClass, TaxClassCountryRate
     from .models import TaxConfiguration, TaxConfigurationPerCountry
 
 
-def get_tax_country(
-    channel: "Channel",
-    is_shipping_required: bool,
-    shipping_address: Optional["Address"] = None,
-    billing_address: Optional["Address"] = None,
-):
-    """Get country code for tax calculations.
-
-    For checkouts and orders, there are following rules for determining the country
-    code that should be used for tax calculations:
-    - when shipping is required, use the shipping address's country code,
-    - when shipping is not required (e.g. because of having only digital products), use
-    the billing address's country code,
-    - fallback to channel's default country when addresses are not provided.
-    """
-    if shipping_address and is_shipping_required:
-        return shipping_address.country.code
-
-    if billing_address and not is_shipping_required:
-        return billing_address.country.code
-
-    return channel.default_country.code
+logger = logging.getLogger(__name__)
 
 
 def get_display_gross_prices(
@@ -73,7 +58,7 @@ def get_charge_taxes(
 def get_tax_calculation_strategy(
     channel_tax_configuration: "TaxConfiguration",
     country_tax_configuration: Optional["TaxConfigurationPerCountry"],
-) -> Optional[str]:
+) -> str:
     """Get tax_calculation_strategy value for tax channel configuration.
 
     :param channel_tax_configuration: Channel-specific tax configuration.
@@ -84,62 +69,35 @@ def get_tax_calculation_strategy(
         country_tax_configuration.tax_calculation_strategy
         if country_tax_configuration
         else channel_tax_configuration.tax_calculation_strategy
+    ) or TaxCalculationStrategy.FLAT_RATES
+
+
+def get_tax_app_id(
+    channel_tax_configuration: "TaxConfiguration",
+    country_tax_configuration: Optional["TaxConfigurationPerCountry"],
+) -> str | None:
+    """Get tax_app_id value for tax channel configuration.
+
+    :param channel_tax_configuration: Channel-specific tax configuration.
+    :param country_tax_configuration: Country-specific tax configuration for the given
+    channel.
+    """
+    return (
+        country_tax_configuration.tax_app_id
+        if country_tax_configuration and country_tax_configuration.tax_app_id
+        else channel_tax_configuration.tax_app_id
     )
 
 
-def get_charge_taxes_for_order(order: "Order") -> bool:
-    """Get charge_taxes value for order."""
+def _get_tax_configuration_for_order(
+    order: "Order",
+) -> tuple["TaxConfiguration", Optional["TaxConfigurationPerCountry"]]:
     channel = order.channel
     tax_configuration = channel.tax_configuration
-    country_code = get_tax_country(
+    country_code = get_active_country(
         channel,
-        order.is_shipping_required(),
         order.shipping_address,
         order.billing_address,
-    )
-    country_tax_configuration = next(
-        (
-            tc
-            for tc in tax_configuration.country_exceptions.all()
-            if tc.country.code == country_code
-        ),
-        None,
-    )
-    return get_charge_taxes(tax_configuration, country_tax_configuration)
-
-
-def get_tax_calculation_strategy_for_order(order: "Order"):
-    """Get tax_calculation_strategy value for order."""
-    channel = order.channel
-    tax_configuration = channel.tax_configuration
-    country_code = get_tax_country(
-        channel,
-        order.is_shipping_required(),
-        order.shipping_address,
-        order.billing_address,
-    )
-    country_tax_configuration = next(
-        (
-            tc
-            for tc in tax_configuration.country_exceptions.all()
-            if tc.country.code == country_code
-        ),
-        None,
-    )
-    return get_tax_calculation_strategy(tax_configuration, country_tax_configuration)
-
-
-def _get_tax_configuration_for_checkout(
-    checkout_info: "CheckoutInfo", lines: Iterable["CheckoutLineInfo"]
-) -> Tuple["TaxConfiguration", Optional["TaxConfigurationPerCountry"]]:
-    from ..checkout.utils import is_shipping_required
-
-    tax_configuration = checkout_info.tax_configuration
-    country_code = get_tax_country(
-        checkout_info.channel,
-        is_shipping_required(lines),
-        checkout_info.shipping_address,
-        checkout_info.billing_address,
     )
     country_tax_configuration = next(
         (
@@ -152,24 +110,88 @@ def _get_tax_configuration_for_checkout(
     return tax_configuration, country_tax_configuration
 
 
+def get_charge_taxes_for_order(order: "Order") -> bool:
+    """Get charge_taxes value for order."""
+    tax_configuration, country_tax_configuration = _get_tax_configuration_for_order(
+        order
+    )
+    return get_charge_taxes(tax_configuration, country_tax_configuration)
+
+
+def get_tax_calculation_strategy_for_order(order: "Order"):
+    """Get tax_calculation_strategy value for order."""
+    tax_configuration, country_tax_configuration = _get_tax_configuration_for_order(
+        order
+    )
+    return get_tax_calculation_strategy(tax_configuration, country_tax_configuration)
+
+
+def get_tax_app_identifier_for_order(order: "Order"):
+    """Get tax_app_id value for order."""
+    tax_configuration, country_tax_configuration = _get_tax_configuration_for_order(
+        order
+    )
+    return get_tax_app_id(tax_configuration, country_tax_configuration)
+
+
+def get_tax_configuration_for_checkout(
+    checkout_info: "CheckoutInfo",
+    lines: list["CheckoutLineInfo"],
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
+) -> tuple["TaxConfiguration", Optional["TaxConfigurationPerCountry"]]:
+    tax_configuration = checkout_info.tax_configuration
+    country_code = get_active_country(
+        checkout_info.channel,
+        checkout_info.shipping_address,
+        checkout_info.billing_address,
+    )
+    country_tax_configuration = next(
+        (
+            tc
+            for tc in tax_configuration.country_exceptions.using(
+                database_connection_name
+            ).all()
+            if tc.country.code == country_code
+        ),
+        None,
+    )
+    return tax_configuration, country_tax_configuration
+
+
 def get_charge_taxes_for_checkout(
-    checkout_info: "CheckoutInfo", lines: Iterable["CheckoutLineInfo"]
+    checkout_info: "CheckoutInfo",
+    lines: list["CheckoutLineInfo"],
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
 ):
     """Get charge_taxes value for checkout."""
-    tax_configuration, country_tax_configuration = _get_tax_configuration_for_checkout(
-        checkout_info, lines
+    tax_configuration, country_tax_configuration = get_tax_configuration_for_checkout(
+        checkout_info, lines, database_connection_name=database_connection_name
     )
     return get_charge_taxes(tax_configuration, country_tax_configuration)
 
 
 def get_tax_calculation_strategy_for_checkout(
-    checkout_info: "CheckoutInfo", lines: Iterable["CheckoutLineInfo"]
+    checkout_info: "CheckoutInfo",
+    lines: list["CheckoutLineInfo"],
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
 ):
     """Get tax_calculation_strategy value for checkout."""
-    tax_configuration, country_tax_configuration = _get_tax_configuration_for_checkout(
-        checkout_info, lines
+    tax_configuration, country_tax_configuration = get_tax_configuration_for_checkout(
+        checkout_info, lines, database_connection_name=database_connection_name
     )
     return get_tax_calculation_strategy(tax_configuration, country_tax_configuration)
+
+
+def get_tax_app_identifier_for_checkout(
+    checkout_info: "CheckoutInfo",
+    lines: list["CheckoutLineInfo"],
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
+):
+    """Get tax_app_id value for checkout."""
+    tax_configuration, country_tax_configuration = get_tax_configuration_for_checkout(
+        checkout_info, lines, database_connection_name=database_connection_name
+    )
+    return get_tax_app_id(tax_configuration, country_tax_configuration)
 
 
 def normalize_tax_rate_for_db(tax_rate: Decimal) -> Decimal:
@@ -232,3 +254,78 @@ def get_shipping_tax_class_kwargs_for_order(tax_class: Optional["TaxClass"]):
         "shipping_tax_class_private_metadata": tax_class.private_metadata,
         "shipping_tax_class_metadata": tax_class.metadata,
     }
+
+
+def validate_tax_data(
+    tax_data: TaxData | None,
+    lines: Iterable,
+    allow_empty_tax_data: bool = False,
+):
+    if tax_data is None and not allow_empty_tax_data:
+        raise TaxDataError(TaxDataErrorMessage.EMPTY)
+
+    if check_negative_values_in_tax_data(tax_data):
+        raise TaxDataError(TaxDataErrorMessage.NEGATIVE_VALUE)
+
+    if check_line_number_in_tax_data(tax_data, lines):
+        raise TaxDataError(TaxDataErrorMessage.LINE_NUMBER)
+
+    if check_overflows_in_tax_data(tax_data):
+        raise TaxDataError(TaxDataErrorMessage.OVERFLOW)
+
+
+def check_negative_values_in_tax_data(tax_data: TaxData | None) -> bool:
+    """Check if tax data contains negative values."""
+    if not tax_data:
+        return False
+
+    if (
+        tax_data.shipping_price_gross_amount < 0
+        or tax_data.shipping_price_net_amount < 0
+        or tax_data.shipping_tax_rate < 0
+    ):
+        return True
+
+    for line in tax_data.lines:
+        if (
+            line.total_gross_amount < 0
+            or line.total_net_amount < 0
+            or line.tax_rate < 0
+        ):
+            return True
+
+    return False
+
+
+def check_line_number_in_tax_data(tax_data: TaxData | None, lines: Iterable) -> bool:
+    """Check if tax data contains same line number as input data."""
+    if not tax_data:
+        return False
+
+    if len(tax_data.lines) != len(list(lines)):
+        return True
+
+    return False
+
+
+def check_overflows_in_tax_data(tax_data: TaxData | None) -> bool:
+    """Check if tax rates exceed 100% and line prices are lower than a billion."""
+    if not tax_data:
+        return False
+
+    if (
+        tax_data.shipping_price_gross_amount > MAXIMUM_PRICE
+        or tax_data.shipping_price_net_amount > MAXIMUM_PRICE
+        or tax_data.shipping_tax_rate > 100
+    ):
+        return True
+
+    for line in tax_data.lines:
+        if (
+            line.total_gross_amount > MAXIMUM_PRICE
+            or line.total_net_amount > MAXIMUM_PRICE
+            or line.tax_rate > 100
+        ):
+            return True
+
+    return False
