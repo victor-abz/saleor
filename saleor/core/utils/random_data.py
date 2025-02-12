@@ -8,11 +8,11 @@ import uuid
 from collections import defaultdict
 from decimal import Decimal
 from functools import lru_cache
-from typing import Type, Union
+from typing import Any, cast
 from unittest.mock import patch
 
+import graphene
 from django.conf import settings
-from django.contrib.auth.models import Group, Permission
 from django.core.files import File
 from django.db import connection
 from django.db.models import F
@@ -23,15 +23,13 @@ from faker.providers import BaseProvider
 from measurement.measures import Weight
 from prices import Money, TaxedMoney
 
-from ...account.models import Address, User
+from ...account.models import Address, Group, User
 from ...account.search import (
     generate_address_search_document_value,
     generate_user_fields_search_document_value,
 )
 from ...account.utils import store_user_address
 from ...attribute.models import (
-    AssignedPageAttribute,
-    AssignedProductAttribute,
     AssignedProductAttributeValue,
     AssignedVariantAttribute,
     AssignedVariantAttributeValue,
@@ -46,19 +44,18 @@ from ...checkout import AddressType
 from ...checkout.fetch import fetch_checkout_info
 from ...checkout.models import Checkout
 from ...checkout.utils import add_variant_to_checkout
-from ...core.permissions import (
-    AccountPermissions,
-    CheckoutPermissions,
-    GiftcardPermissions,
-    OrderPermissions,
-    get_permissions,
-)
 from ...core.weight import zero_weight
-from ...discount import DiscountValueType, VoucherType
-from ...discount.models import Sale, SaleChannelListing, Voucher, VoucherChannelListing
-from ...discount.utils import fetch_discounts
+from ...discount import DiscountValueType, RewardValueType, VoucherType
+from ...discount.models import (
+    Promotion,
+    PromotionRule,
+    Voucher,
+    VoucherChannelListing,
+    VoucherCode,
+)
 from ...giftcard import events as gift_card_events
 from ...giftcard.models import GiftCard, GiftCardTag
+from ...graphql.discount.enums import RewardTypeEnum
 from ...menu.models import Menu, MenuItem
 from ...order import OrderStatus
 from ...order.models import Fulfillment, Order, OrderLine
@@ -67,6 +64,14 @@ from ...order.utils import update_order_status
 from ...page.models import Page, PageType
 from ...payment import gateway
 from ...payment.utils import create_payment
+from ...permission.enums import (
+    AccountPermissions,
+    CheckoutPermissions,
+    GiftcardPermissions,
+    OrderPermissions,
+    get_permissions,
+)
+from ...permission.models import Permission
 from ...plugins.manager import get_plugins_manager
 from ...product.models import (
     Category,
@@ -82,8 +87,10 @@ from ...product.models import (
     VariantMedia,
 )
 from ...product.search import update_products_search_vector
-from ...product.tasks import update_products_discounted_prices_of_discount_task
-from ...product.utils.variant_prices import update_products_discounted_prices
+from ...product.tasks import (
+    recalculate_discounted_price_for_products_task,
+    update_variant_relations_for_active_promotion_rules_task,
+)
 from ...shipping.models import (
     ShippingMethod,
     ShippingMethodChannelListing,
@@ -97,7 +104,7 @@ from ...warehouse.management import increase_stock
 from ...warehouse.models import PreorderAllocation, Stock, Warehouse
 from ..postgres import FlatConcatSearchVector
 
-fake = Factory.create()
+fake = cast(Any, Factory.create())
 fake.seed(0)
 
 PRODUCTS_LIST_DIR = "products-list/"
@@ -163,7 +170,7 @@ CATEGORY_IMAGES = {
 COLLECTION_IMAGES = {1: "summer.jpg", 2: "clothing.jpg", 3: "clothing.jpg"}
 
 
-@lru_cache()
+@lru_cache
 def get_sample_data():
     path = os.path.join(
         settings.PROJECT_ROOT, "saleor", "static", "populatedb_data.json"
@@ -339,7 +346,7 @@ def create_product_variant_channel_listings(product_variant_channel_listings_dat
 
 
 def assign_attributes_to_product_types(
-    association_model: Union[Type[AttributeProduct], Type[AttributeVariant]],
+    association_model: type[AttributeProduct] | type[AttributeVariant],
     attributes: list,
 ):
     for value in attributes:
@@ -351,7 +358,7 @@ def assign_attributes_to_product_types(
 
 
 def assign_attributes_to_page_types(
-    association_model: AttributePage,
+    association_model: type[AttributePage],
     attributes: list,
 ):
     for value in attributes:
@@ -362,21 +369,12 @@ def assign_attributes_to_page_types(
         association_model.objects.update_or_create(pk=pk, defaults=defaults)
 
 
-def assign_attributes_to_products(product_attributes):
-    for value in product_attributes:
-        pk = value["pk"]
-        defaults = dict(value["fields"])
-        defaults["product_id"] = defaults.pop("product")
-        defaults["assignment_id"] = defaults.pop("assignment")
-        AssignedProductAttribute.objects.update_or_create(pk=pk, defaults=defaults)
-
-
 def assign_attribute_values_to_products(values):
     for value in values:
         pk = value["pk"]
         defaults = dict(value["fields"])
         defaults["value_id"] = defaults.pop("value")
-        defaults["assignment_id"] = defaults.pop("assignment")
+        defaults["product_id"] = defaults.pop("product")
         AssignedProductAttributeValue.objects.update_or_create(pk=pk, defaults=defaults)
 
 
@@ -396,20 +394,6 @@ def assign_attribute_values_to_variants(variant_attribute_values):
         defaults["value_id"] = defaults.pop("value")
         defaults["assignment_id"] = defaults.pop("assignment")
         AssignedVariantAttributeValue.objects.update_or_create(pk=pk, defaults=defaults)
-
-
-def assign_attributes_to_pages(page_attributes):
-    for value in page_attributes:
-        pk = value["pk"]
-        defaults = dict(value["fields"])
-        defaults["page_id"] = defaults.pop("page")
-        defaults["assignment_id"] = defaults.pop("assignment")
-        assigned_values = defaults.pop("values")
-        assoc, created = AssignedPageAttribute.objects.update_or_create(
-            pk=pk, defaults=defaults
-        )
-        if created:
-            assoc.values.set(AttributeValue.objects.filter(pk__in=assigned_values))
 
 
 def set_field_as_money(defaults, field):
@@ -453,9 +437,6 @@ def create_products_by_schema(placeholder_dir, create_images):
     assign_attributes_to_page_types(
         AttributePage, attributes=types["attribute.attributepage"]
     )
-    assign_attributes_to_products(
-        product_attributes=types["attribute.assignedproductattribute"]
-    )
     assign_attribute_values_to_products(
         types["attribute.assignedproductattributevalue"]
     )
@@ -465,7 +446,6 @@ def create_products_by_schema(placeholder_dir, create_images):
     assign_attribute_values_to_variants(
         types["attribute.assignedvariantattributevalue"]
     )
-    assign_attributes_to_pages(page_attributes=types["attribute.assignedpageattribute"])
     create_collections(
         data=types["product.collection"], placeholder_dir=placeholder_dir
     )
@@ -475,8 +455,7 @@ def create_products_by_schema(placeholder_dir, create_images):
     assign_products_to_collections(associations=types["product.collectionproduct"])
 
     all_products_qs = Product.objects.all()
-    update_products_search_vector(all_products_qs)
-    update_products_discounted_prices(all_products_qs)
+    update_products_search_vector(all_products_qs.values_list("id", flat=True))
 
 
 class SaleorProvider(BaseProvider):
@@ -487,7 +466,7 @@ class SaleorProvider(BaseProvider):
         return Weight(kg=fake.pydecimal(1, 2, positive=True))
 
 
-fake.add_provider(SaleorProvider)  # type: ignore
+fake.add_provider(SaleorProvider)
 
 
 def get_email(first_name, last_name):
@@ -530,7 +509,7 @@ def create_address(save=True, **kwargs):
     return address
 
 
-def create_fake_user(user_password, save=True):
+def create_fake_user(user_password, save=True, generate_id=False):
     address = create_address(save=save)
     email = get_email(address.first_name, address.last_name)
 
@@ -540,19 +519,25 @@ def create_fake_user(user_password, save=True):
     except User.DoesNotExist:
         pass
 
-    _, max_user_id = connection.ops.integer_field_range(
-        User.id.field.get_internal_type()
-    )
+    user_params = {
+        "first_name": address.first_name,
+        "last_name": address.last_name,
+        "email": email,
+        "default_billing_address": address,
+        "default_shipping_address": address,
+        "is_active": True,
+        "note": fake.paragraph(),
+        "date_joined": fake.date_time(tzinfo=datetime.UTC),
+    }
+
+    if generate_id:
+        _, max_user_id = connection.ops.integer_field_range(
+            User.id.field.get_internal_type()
+        )
+        user_params["id"] = fake.random_int(min=1, max=max_user_id)
+
     user = User(
-        id=fake.random_int(min=1, max=max_user_id),
-        first_name=address.first_name,
-        last_name=address.last_name,
-        email=email,
-        default_billing_address=address,
-        default_shipping_address=address,
-        is_active=True,
-        note=fake.paragraph(),
-        date_joined=fake.date_time(tzinfo=timezone.get_current_timezone()),
+        **user_params,
     )
     user.search_document = _prepare_search_document_value(user, address)
 
@@ -576,7 +561,7 @@ def create_fake_payment(mock_notify, order):
         total=order.total.gross.amount,
         currency=order.total.gross.currency,
     )
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
 
     # Create authorization transaction
     gateway.authorize(payment, payment.token, manager, order.channel.slug)
@@ -595,7 +580,7 @@ def create_fake_payment(mock_notify, order):
     return payment
 
 
-def create_order_lines(order, discounts, how_many=10):
+def create_order_lines(order, how_many=10):
     channel = order.channel
     available_variant_ids = channel.variant_listings.values_list(
         "variant_id", flat=True
@@ -609,22 +594,22 @@ def create_order_lines(order, discounts, how_many=10):
     lines = []
     for _ in range(how_many):
         variant = next(variants_iter)
-        lines.append(_get_new_order_line(order, variant, channel, discounts))
+        lines.append(_get_new_order_line(order, variant, channel))
 
     lines = OrderLine.objects.bulk_create(lines)
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     country = order.shipping_method.shipping_zone.countries[0]
     warehouses = Warehouse.objects.filter(
         shipping_zones__countries__contains=country
     ).order_by("?")
     warehouse_iter = itertools.cycle(warehouses)
     for line in lines:
-        variant = line.variant
+        variant = cast(ProductVariant, line.variant)
         unit_price_data = manager.calculate_order_line_unit(
-            order, line, variant, variant.product
+            order, line, variant, variant.product, lines
         )
         total_price_data = manager.calculate_order_line_total(
-            order, line, variant, variant.product
+            order, line, variant, variant.product, lines
         )
         line.unit_price = unit_price_data.price_with_discounts
         line.total_price = total_price_data.price_with_discounts
@@ -652,7 +637,7 @@ def create_order_lines(order, discounts, how_many=10):
     return lines
 
 
-def create_order_lines_with_preorder(order, discounts, how_many=1):
+def create_order_lines_with_preorder(order, how_many=1):
     channel = order.channel
     available_variant_ids = channel.variant_listings.values_list(
         "variant_id", flat=True
@@ -666,19 +651,19 @@ def create_order_lines_with_preorder(order, discounts, how_many=1):
     lines = []
     for _ in range(how_many):
         variant = next(variants_iter)
-        lines.append(_get_new_order_line(order, variant, channel, discounts))
+        lines.append(_get_new_order_line(order, variant, channel))
 
     lines = OrderLine.objects.bulk_create(lines)
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
 
     preorder_allocations = []
     for line in lines:
-        variant = line.variant
+        variant = cast(ProductVariant, line.variant)
         unit_price_data = manager.calculate_order_line_unit(
-            order, line, variant, variant.product
+            order, line, variant, variant.product, lines
         )
         total_price_data = manager.calculate_order_line_total(
-            order, line, variant, variant.product
+            order, line, variant, variant.product, lines
         )
         line.unit_price = unit_price_data.price_with_discounts
         line.total_price = total_price_data.price_with_discounts
@@ -714,7 +699,7 @@ def create_order_lines_with_preorder(order, discounts, how_many=1):
     return lines
 
 
-def _get_new_order_line(order, variant, channel, discounts):
+def _get_new_order_line(order, variant, channel):
     variant_channel_listing = variant.channel_listings.get(channel=channel)
     product = variant.product
     quantity = random.randrange(
@@ -724,15 +709,11 @@ def _get_new_order_line(order, variant, channel, discounts):
         or 5,
     )
     untaxed_unit_price = variant.get_price(
-        product,
-        product.collections.all(),
-        channel,
         variant_channel_listing,
-        discounts,
     )
     unit_price = TaxedMoney(net=untaxed_unit_price, gross=untaxed_unit_price)
     total_price = unit_price * quantity
-    return OrderLine(
+    return OrderLine(  # type: ignore[misc] # see below:
         order=order,
         product_name=str(product),
         variant_name=str(variant),
@@ -742,12 +723,12 @@ def _get_new_order_line(order, variant, channel, discounts):
         is_gift_card=variant.is_gift_card(),
         quantity=quantity,
         variant=variant,
-        unit_price=unit_price,
-        total_price=total_price,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=total_price,
-        base_unit_price=untaxed_unit_price,
-        undiscounted_base_unit_price=untaxed_unit_price,
+        unit_price=unit_price,  # money field not supported by mypy_django_plugin
+        total_price=total_price,  # money field not supported by mypy_django_plugin
+        undiscounted_unit_price=unit_price,  # money field not supported by mypy_django_plugin # noqa: E501
+        undiscounted_total_price=total_price,  # money field not supported by mypy_django_plugin # noqa: E501
+        base_unit_price=untaxed_unit_price,  # money field not supported by mypy_django_plugin # noqa: E501
+        undiscounted_base_unit_price=untaxed_unit_price,  # money field not supported by mypy_django_plugin # noqa: E501
         tax_rate=0,
         **get_tax_class_kwargs_for_order_line(product.tax_class),
     )
@@ -759,24 +740,28 @@ def create_fulfillments(order):
             fulfillment, _ = Fulfillment.objects.get_or_create(order=order)
             quantity = random.randrange(0, line.quantity) + 1
             allocation = line.allocations.get()
-            fulfillment.lines.create(
-                order_line=line, quantity=quantity, stock=allocation.stock
-            )
+            stock = allocation.stock
+            fulfillment.lines.create(order_line=line, quantity=quantity, stock=stock)
             line.quantity_fulfilled = quantity
             line.save(update_fields=["quantity_fulfilled"])
 
             allocation.quantity_allocated = F("quantity_allocated") - quantity
             allocation.save(update_fields=["quantity_allocated"])
 
+            stock.quantity_allocated = F("quantity_allocated") - quantity
+            stock.save(update_fields=["quantity_allocated"])
+
     update_order_status(order)
 
 
-def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False):
+def create_fake_order(max_order_lines=5, create_preorder_lines=False):
     channel = (
         Channel.objects.filter(slug__in=[settings.DEFAULT_CHANNEL_SLUG, "channel-pln"])
         .order_by("?")
         .first()
     )
+    if not channel:
+        raise ValueError("No channel found.")
     customers = (
         User.objects.filter(is_superuser=False)
         .exclude(default_billing_address=None)
@@ -789,26 +774,27 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
         random.choice([0, 0, 0, 0, 1]) if not create_preorder_lines else True
     )
 
-    if customer:
+    if customer and customer.default_shipping_address:
         address = customer.default_shipping_address
-        order_data = {
-            "user": customer,
-            "billing_address": customer.default_billing_address,
-            "shipping_address": address,
-        }
     else:
         address = create_address()
-        order_data = {
-            "billing_address": address,
-            "shipping_address": address,
-            "user_email": get_email(address.first_name, address.last_name),
-        }
+    if customer and customer.default_billing_address:
+        billing_address = customer.default_billing_address
+    else:
+        billing_address = address
+    order_data: dict[str, Any] = {
+        "billing_address": billing_address or address,
+        "shipping_address": address,
+        "user_email": get_email(address.first_name, address.last_name),
+    }
 
     shipping_method_channel_listing = (
         ShippingMethodChannelListing.objects.filter(channel=channel)
         .order_by("?")
         .first()
     )
+    if not shipping_method_channel_listing:
+        raise Exception(f"No shipping method found for channel {channel.slug}")
     shipping_method = shipping_method_channel_listing.shipping_method
     shipping_price = shipping_method_channel_listing.price
     shipping_price = TaxedMoney(net=shipping_price, gross=shipping_price)
@@ -819,6 +805,7 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
             "shipping_method_name": shipping_method.name,
             "shipping_price": shipping_price,
             "base_shipping_price": shipping_method_channel_listing.price,
+            "undiscounted_base_shipping_price": shipping_method_channel_listing.price,
         }
     )
     if will_be_unconfirmed:
@@ -826,15 +813,14 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
 
     order = Order.objects.create(**order_data)
     if create_preorder_lines:
-        lines = create_order_lines_with_preorder(order, discounts)
+        lines = create_order_lines_with_preorder(order)
     else:
-        lines = create_order_lines(
-            order, discounts, random.randrange(1, max_order_lines)
-        )
+        lines = create_order_lines(order, random.randrange(1, max_order_lines))
     order.total = sum([line.total_price for line in lines], shipping_price)
     weight = Weight(kg=0)
     for line in order.lines.all():
-        weight += line.variant.get_weight()
+        if line.variant:
+            weight += line.variant.get_weight()
     order.weight = weight
     order.search_vector = FlatConcatSearchVector(
         *prepare_order_search_vector_value(order)
@@ -849,24 +835,86 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
     return order
 
 
-def create_fake_sale():
-    sale = Sale.objects.create(
+def create_fake_catalogue_promotion():
+    promotion = Promotion.objects.create(
         name=f"Happy {fake.word()} day!",
-        type=DiscountValueType.PERCENTAGE,
     )
-    for channel in Channel.objects.all():
-        SaleChannelListing.objects.create(
-            channel=channel,
-            currency=channel.currency_code,
-            sale=sale,
-            discount_value=random.choice([10, 20, 30, 40, 50]),
-        )
-    for product in Product.objects.all().order_by("?")[:2]:
-        sale.products.add(product)
+    rules = PromotionRule.objects.bulk_create(
+        [
+            PromotionRule(
+                promotion=promotion,
+                reward_value_type=RewardValueType.PERCENTAGE,
+                reward_value=random.choice([10, 20, 30, 40, 50]),
+                variants_dirty=True,
+                catalogue_predicate={
+                    "productPredicate": {
+                        "ids": [
+                            graphene.Node.to_global_id("Product", product.id)
+                            for product in Product.objects.all().order_by("?")[:2]
+                        ]
+                    }
+                },
+            ),
+            PromotionRule(
+                promotion=promotion,
+                reward_value_type=RewardValueType.PERCENTAGE,
+                reward_value=random.choice([10, 20, 30, 40, 50]),
+                variants_dirty=True,
+                catalogue_predicate={
+                    "variantPredicate": {
+                        "ids": [
+                            graphene.Node.to_global_id("ProductVariant", variant.id)
+                            for variant in ProductVariant.objects.all().order_by("?")[
+                                :2
+                            ]
+                        ]
+                    }
+                },
+            ),
+        ]
+    )
+    channels = Channel.objects.all()
+    for rule in rules:
+        rule.channels.add(*channels)
 
-    for variant in ProductVariant.objects.all().order_by("?")[:2]:
-        sale.variants.add(variant)
-    return sale
+    return promotion
+
+
+def create_fake_order_promotion():
+    promotion = Promotion.objects.create(
+        name=f"Happy {fake.word()} day!",
+    )
+    rules = PromotionRule.objects.bulk_create(
+        [
+            PromotionRule(
+                promotion=promotion,
+                reward_value_type=RewardValueType.PERCENTAGE,
+                reward_value=random.choice([10, 20, 30, 40, 50]),
+                reward_type=RewardTypeEnum.SUBTOTAL_DISCOUNT.name,
+                order_predicate={
+                    "discountedObjectPredicate": {
+                        "baseSubtotalPrice": {"range": {"gte": "200"}}
+                    }
+                },
+            ),
+            PromotionRule(
+                promotion=promotion,
+                reward_value_type=RewardValueType.FIXED,
+                reward_value=random.choice([10, 20, 30, 40, 50]),
+                reward_type=RewardTypeEnum.SUBTOTAL_DISCOUNT.name,
+                order_predicate={
+                    "discountedObjectPredicate": {
+                        "baseSubtotalPrice": {"range": {"gte": "100"}}
+                    }
+                },
+            ),
+        ]
+    )
+    channels = Channel.objects.all()
+    for rule in rules:
+        rule.channels.add(*channels)
+
+    return promotion
 
 
 def create_users(user_password, how_many=10):
@@ -918,7 +966,7 @@ def create_staffs(staff_password):
 def create_group(name, permissions, users):
     group, _ = Group.objects.get_or_create(name=name)
     group.permissions.add(*permissions)
-    group.user_set.add(*users)
+    group.user_set.add(*users)  # type: ignore[attr-defined]
     return group
 
 
@@ -947,6 +995,7 @@ def _create_staff_user(staff_password, email=None, superuser=False):
             User(email=email, first_name=first_name, last_name=last_name), address
         ),
     )
+    staff_user.addresses.add(address)
     return staff_user
 
 
@@ -965,17 +1014,25 @@ def create_staff_users(staff_password, how_many=2, superuser=False):
 
 
 def create_orders(how_many=10):
-    discounts = fetch_discounts(timezone.now())
     for _ in range(how_many):
-        order = create_fake_order(discounts)
+        order = create_fake_order()
         yield f"Order: {order}"
 
 
-def create_product_sales(how_many=5):
+def create_catalogue_promotions(how_many=5):
     for _ in range(how_many):
-        sale = create_fake_sale()
-        update_products_discounted_prices_of_discount_task.delay(sale.pk)
-        yield f"Sale: {sale}"
+        promotion = create_fake_catalogue_promotion()
+        yield f"Promotion: {promotion}"
+    # recalculation is handled by celery beat, so we trigger it manually, to receive the
+    # correct amounts in random data created by saleor.
+    update_variant_relations_for_active_promotion_rules_task()
+    recalculate_discounted_price_for_products_task()
+
+
+def create_order_promotions(how_many=5):
+    for _ in range(how_many):
+        promotion = create_fake_order_promotion()
+        yield f"Promotion: {promotion}"
 
 
 def create_channel(channel_name, currency_code, slug=None, country=None):
@@ -1045,7 +1102,7 @@ def create_shipping_zone(shipping_methods_names, countries, shipping_zone_name):
             ]
         )
     shipping_zone.channels.add(*channels)
-    return "Shipping Zone: %s" % shipping_zone
+    return f"Shipping Zone: {shipping_zone}"
 
 
 def create_shipping_zones():
@@ -1341,7 +1398,11 @@ def create_shipping_zones():
 
 def create_additional_cc_warehouse():
     channel = Channel.objects.first()
+    if not channel:
+        raise Exception("No channels found")
     shipping_zone = ShippingZone.objects.first()
+    if not shipping_zone:
+        raise Exception("No shipping zones found")
     warehouse_name = f"{shipping_zone.name} for click and collect"
     warehouse, _ = Warehouse.objects.update_or_create(
         name=warehouse_name,
@@ -1388,13 +1449,13 @@ def create_warehouses():
 def create_vouchers():
     channels = list(Channel.objects.all())
     voucher, created = Voucher.objects.get_or_create(
-        code="FREESHIPPING",
+        name="Free shipping",
         defaults={
             "type": VoucherType.SHIPPING,
-            "name": "Free shipping",
             "discount_value_type": DiscountValueType.PERCENTAGE,
         },
     )
+    VoucherCode.objects.get_or_create(voucher=voucher, code="FREESHIPPING")
     for channel in channels:
         VoucherChannelListing.objects.get_or_create(
             voucher=voucher,
@@ -1402,18 +1463,19 @@ def create_vouchers():
             defaults={"discount_value": 100, "currency": channel.currency_code},
         )
     if created:
-        yield "Voucher #%d" % voucher.id
+        yield f"Voucher #{voucher.pk}"
     else:
         yield "Shipping voucher already exists"
 
     voucher, created = Voucher.objects.get_or_create(
-        code="DISCOUNT",
+        name="Big order discount",
         defaults={
             "type": VoucherType.ENTIRE_ORDER,
-            "name": "Big order discount",
             "discount_value_type": DiscountValueType.FIXED,
         },
     )
+    VoucherCode.objects.get_or_create(voucher=voucher, code="DISCOUNT")
+
     for channel in channels:
         discount_value = 25
         min_spent_amount = 200
@@ -1430,17 +1492,19 @@ def create_vouchers():
             },
         )
     if created:
-        yield "Voucher #%d" % voucher.id
+        yield f"Voucher #{voucher.pk}"
     else:
         yield "Value voucher already exists"
 
     voucher, created = Voucher.objects.get_or_create(
-        code="VCO9KV98LC",
+        name="Percentage order discount",
         defaults={
             "type": VoucherType.ENTIRE_ORDER,
             "discount_value_type": DiscountValueType.PERCENTAGE,
         },
     )
+    VoucherCode.objects.get_or_create(voucher=voucher, code="VCO9KV98LC")
+
     for channel in channels:
         VoucherChannelListing.objects.get_or_create(
             voucher=voucher,
@@ -1448,7 +1512,7 @@ def create_vouchers():
             defaults={"discount_value": 5, "currency": channel.currency_code},
         )
     if created:
-        yield "Voucher #%d" % voucher.id
+        yield f"Voucher #{voucher.pk}"
     else:
         yield "Value voucher already exists"
 
@@ -1462,7 +1526,7 @@ def create_gift_cards(how_many=5):
     for i in range(how_many):
         staff_user = User.objects.filter(is_staff=True).order_by("?").first()
         gift_card, created = GiftCard.objects.get_or_create(
-            code=f"Gift_card_{i+1}",
+            code=f"Gift_card_{i + 1}",
             defaults={
                 "created_by": staff_user,
                 "initial_balance": Money(50, DEFAULT_CURRENCY),
@@ -1472,13 +1536,13 @@ def create_gift_cards(how_many=5):
         gift_card.tags.add(tag)
         gift_card_events.gift_card_issued_event(gift_card, staff_user, None)
         if created:
-            yield "Gift card #%d" % gift_card.id
+            yield f"Gift card #{gift_card.pk}"
         else:
             yield "Gift card already exists"
 
         user = User.objects.filter(is_superuser=False).order_by("?").first()
         gift_card, created = GiftCard.objects.get_or_create(
-            code=f"Gift_card_1{i+1}",
+            code=f"Gift_card_1{i + 1}",
             defaults={
                 "created_by": user,
                 "product_id": product_pk,
@@ -1487,9 +1551,11 @@ def create_gift_cards(how_many=5):
             },
         )
         order = Order.objects.order_by("?").first()
+        if not order:
+            raise Exception("No orders found")
         gift_card_events.gift_cards_bought_event([gift_card], order, user, None)
         if created:
-            yield "Gift card #%d" % gift_card.id
+            yield f"Gift card #{gift_card.pk}"
         else:
             yield "Gift card already exists"
 
@@ -1497,7 +1563,7 @@ def create_gift_cards(how_many=5):
 def add_address_to_admin(email):
     address = create_address()
     user = User.objects.get(email=email)
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     store_user_address(user, address, AddressType.BILLING, manager)
     store_user_address(user, address, AddressType.SHIPPING, manager)
 
@@ -1567,7 +1633,9 @@ def prepare_checkout_info():
     channel = Channel.objects.get(slug=settings.DEFAULT_CHANNEL_SLUG)
     checkout = Checkout.objects.create(currency=channel.currency_code, channel=channel)
     checkout.set_country(channel.default_country, commit=True)
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
+    checkout_info = fetch_checkout_info(
+        checkout, [], get_plugins_manager(allow_replica=False)
+    )
     return checkout_info
 
 

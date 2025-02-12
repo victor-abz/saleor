@@ -1,7 +1,6 @@
 import datetime
 
 import graphene
-import pytz
 
 from .....product.error_codes import CollectionErrorCode
 from ....tests.utils import get_graphql_content
@@ -41,7 +40,7 @@ def test_collection_channel_listing_update_as_staff_user(
     channel_PLN,
 ):
     # given
-    publication_date = datetime.date.today()
+    publication_date = datetime.datetime.now(tz=datetime.UTC).date()
     collection_id = graphene.Node.to_global_id("Collection", published_collection.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_PLN.id)
     variables = {
@@ -97,7 +96,7 @@ def test_collection_channel_listing_update_as_app(
     channel_PLN,
 ):
     # given
-    publication_date = datetime.date.today()
+    publication_date = datetime.datetime.now(tz=datetime.UTC).date()
     collection_id = graphene.Node.to_global_id("Collection", published_collection.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_PLN.id)
     variables = {
@@ -152,7 +151,7 @@ def test_collection_channel_listing_update_add_channel(
     channel_PLN,
 ):
     # given
-    publication_date = datetime.date.today()
+    publication_date = datetime.datetime.now(tz=datetime.UTC).date()
     collection_id = graphene.Node.to_global_id("Collection", published_collection.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_PLN.id)
     variables = {
@@ -203,7 +202,7 @@ def test_collection_channel_listing_update_update_publication_date(
     staff_api_client, collection, permission_manage_products, channel_USD
 ):
     # given
-    publication_date = datetime.date.today()
+    publication_date = datetime.datetime.now(tz=datetime.UTC).date()
     collection_id = graphene.Node.to_global_id("Collection", collection.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
     variables = {
@@ -238,11 +237,10 @@ def test_collection_channel_listing_update_update_publication_date(
 def test_collection_channel_listing_update_update_publication_date_and_published_at(
     staff_api_client, collection, permission_manage_products, channel_USD
 ):
-    """Ensure an error is raised when both publicationDate and publishedAt date
-    is given."""
+    """Test that filtering by publication time and date are mutually exclusive."""
     # given
-    publication_date = datetime.date.today()
-    published_at = datetime.datetime.now(pytz.utc)
+    published_at = datetime.datetime.now(tz=datetime.UTC)
+    publication_date = published_at.date()
     collection_id = graphene.Node.to_global_id("Collection", collection.pk)
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
     variables = {

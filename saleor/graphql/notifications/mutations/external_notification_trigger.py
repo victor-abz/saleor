@@ -11,12 +11,12 @@ from ....core.notification.validation import (
     validate_and_get_payload_params,
     validate_ids_and_get_model_type_and_pks,
 )
-from ...core.descriptions import ADDED_IN_31
+from ...core import ResolveInfo
 from ...core.fields import JSONString
 from ...core.mutations import BaseMutation
 from ...core.types import ExternalNotificationError, NonNullList
 from ...notifications.error_codes import ExternalNotificationErrorCodes
-from ...plugins.dataloaders import load_plugin_manager
+from ...plugins.dataloaders import get_plugin_manager_promise
 
 
 class ExternalNotificationTriggerInput(graphene.InputObjectType):
@@ -31,7 +31,7 @@ class ExternalNotificationTriggerInput(graphene.InputObjectType):
     extra_payload = JSONString(
         description=(
             "Additional payload that will be merged with "
-            "the one based on the bussines object ID."
+            "the one based on the business object ID."
         )
     )
     external_event_type = graphene.String(
@@ -61,13 +61,13 @@ class ExternalNotificationTrigger(BaseMutation):
         description = (
             "Trigger sending a notification with the notify plugin method. "
             "Serializes nodes provided as ids parameter and includes this data in "
-            "the notification payload." + ADDED_IN_31
+            "the notification payload."
         )
         error_type_class = ExternalNotificationError
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        manager = load_plugin_manager(info.context)
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
+        manager = get_plugin_manager_promise(info.context).get()
         plugin_id = data.get("plugin_id")
         channel_slug = validate_and_get_channel(data, ExternalNotificationErrorCodes)
         if data_input := data.get("input"):

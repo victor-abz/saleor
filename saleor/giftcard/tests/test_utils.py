@@ -1,17 +1,25 @@
-from datetime import date, timedelta
+import datetime
+import json
 from unittest.mock import patch
 
+import graphene
 import pytest
 from dateutil.relativedelta import relativedelta
+from django.core.exceptions import ValidationError
 from django.utils import timezone
+from freezegun import freeze_time
 
+from ...checkout.error_codes import CheckoutErrorCode
 from ...core import TimePeriodType
 from ...core.exceptions import GiftCardNotApplicable
+from ...core.utils.json_serializer import CustomJsonEncoder
 from ...core.utils.promo_code import InvalidPromoCode
+from ...order import OrderEvents
 from ...order.models import OrderLine
 from ...plugins.manager import get_plugins_manager
 from ...site import GiftCardSettingsExpiryType
-from ...tests.utils import flush_post_commit_hooks
+from ...webhook.event_types import WebhookEventAsyncType
+from ...webhook.payloads import generate_meta, generate_requestor
 from .. import GiftCardEvents, GiftCardLineData, events
 from ..models import GiftCard, GiftCardEvent
 from ..utils import (
@@ -26,7 +34,7 @@ from ..utils import (
     gift_cards_create,
     is_gift_card_expired,
     order_has_gift_card_lines,
-    remove_gift_card_code_from_checkout,
+    remove_gift_card_code_from_checkout_or_error,
 )
 
 
@@ -38,6 +46,17 @@ def test_add_gift_card_code_to_checkout(checkout, gift_card):
     add_gift_card_code_to_checkout(
         checkout, "test@example.com", gift_card.code, gift_card.currency
     )
+
+    # then
+    assert checkout.gift_cards.count() == 1
+
+
+def test_add_gift_card_code_to_checkout_without_email(checkout, gift_card):
+    # given
+    assert checkout.gift_cards.count() == 0
+
+    # when
+    add_gift_card_code_to_checkout(checkout, None, gift_card.code, gift_card.currency)
 
     # then
     assert checkout.gift_cards.count() == 1
@@ -60,7 +79,9 @@ def test_add_gift_card_code_to_checkout_inactive_card(checkout, gift_card):
 
 def test_add_gift_card_code_to_checkout_expired_card(checkout, gift_card):
     # given
-    gift_card.expiry_date = date.today() - timedelta(days=10)
+    gift_card.expiry_date = datetime.datetime.now(
+        tz=datetime.UTC
+    ).date() - datetime.timedelta(days=10)
     gift_card.save(update_fields=["expiry_date"])
 
     assert checkout.gift_cards.count() == 0
@@ -105,30 +126,13 @@ def test_add_gift_card_code_to_checkout_used_gift_card(checkout, gift_card_used)
     assert checkout.gift_cards.count() == 1
 
 
-def test_add_gift_card_code_to_checkout_used_gift_card_invalid_user(
-    checkout, gift_card_used
-):
-    # given
-    email = "new_user@example.com"
-    assert gift_card_used.used_by_email
-    assert gift_card_used.used_by_email != email
-    assert checkout.gift_cards.count() == 0
-
-    # when
-    # then
-    with pytest.raises(InvalidPromoCode):
-        add_gift_card_code_to_checkout(
-            checkout, email, gift_card_used.code, gift_card_used.currency
-        )
-
-
 def test_remove_gift_card_code_from_checkout(checkout, gift_card):
     # given
     checkout.gift_cards.add(gift_card)
     assert checkout.gift_cards.count() == 1
 
     # when
-    remove_gift_card_code_from_checkout(checkout, gift_card.code)
+    remove_gift_card_code_from_checkout_or_error(checkout, gift_card.code)
 
     # then
     assert checkout.gift_cards.count() == 0
@@ -141,14 +145,20 @@ def test_remove_gift_card_code_from_checkout_no_checkout_gift_cards(
     assert checkout.gift_cards.count() == 0
 
     # when
-    remove_gift_card_code_from_checkout(checkout, gift_card.code)
+    with pytest.raises(ValidationError) as error:
+        remove_gift_card_code_from_checkout_or_error(checkout, gift_card.code)
 
     # then
     assert checkout.gift_cards.count() == 0
+    assert error.value.message == (
+        "Cannot remove a gift card not attached to this checkout."
+    )
+    assert error.value.code == CheckoutErrorCode.INVALID.value
 
 
 @pytest.mark.parametrize(
-    "period_type, period", [("years", 5), ("weeks", 1), ("months", 13), ("days", 100)]
+    ("period_type", "period"),
+    [("years", 5), ("weeks", 1), ("months", 13), ("days", 100)],
 )
 def test_calculate_expiry_settings(period_type, period, site_settings):
     # given
@@ -189,9 +199,10 @@ def test_gift_cards_create(
     gift_card_non_shippable_order_line,
     site_settings,
     staff_user,
+    django_capture_on_commit_callbacks,
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     line_1, line_2 = gift_card_shippable_order_line, gift_card_non_shippable_order_line
     user_email = order.user_email
     fulfillment = order.fulfillments.create(tracking_number="123")
@@ -221,9 +232,10 @@ def test_gift_cards_create(
     ]
 
     # when
-    gift_cards = gift_cards_create(
-        order, lines_data, site_settings, staff_user, None, manager
-    )
+    with django_capture_on_commit_callbacks(execute=True):
+        gift_cards = gift_cards_create(
+            order, lines_data, site_settings, staff_user, None, manager
+        )
 
     # then
     assert len(gift_cards) == len(lines_data)
@@ -267,8 +279,6 @@ def test_gift_cards_create(
         "expiry_date": None,
     }
 
-    flush_post_commit_hooks()
-
     send_notification_mock.assert_called_once_with(
         staff_user,
         None,
@@ -289,9 +299,10 @@ def test_gift_cards_create_expiry_date_set(
     gift_card_non_shippable_order_line,
     site_settings,
     staff_user,
+    django_capture_on_commit_callbacks,
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     site_settings.gift_card_expiry_type = GiftCardSettingsExpiryType.EXPIRY_PERIOD
     site_settings.gift_card_expiry_period_type = TimePeriodType.WEEK
     site_settings.gift_card_expiry_period = 20
@@ -320,9 +331,10 @@ def test_gift_cards_create_expiry_date_set(
     ]
 
     # when
-    gift_cards = gift_cards_create(
-        order, lines_data, site_settings, staff_user, None, manager
-    )
+    with django_capture_on_commit_callbacks(execute=True):
+        gift_cards = gift_cards_create(
+            order, lines_data, site_settings, staff_user, None, manager
+        )
 
     # then
     assert len(gift_cards) == len(lines_data)
@@ -344,8 +356,6 @@ def test_gift_cards_create_expiry_date_set(
         "expiry_date": gift_card.expiry_date.isoformat(),
     }
 
-    flush_post_commit_hooks()
-
     send_notification_mock.assert_called_once_with(
         staff_user,
         None,
@@ -365,9 +375,10 @@ def test_gift_cards_create_multiple_quantity(
     gift_card_non_shippable_order_line,
     site_settings,
     staff_user,
+    django_capture_on_commit_callbacks,
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     quantity = 3
     gift_card_non_shippable_order_line.quantity = quantity
     gift_card_non_shippable_order_line.save(update_fields=["quantity"])
@@ -386,12 +397,12 @@ def test_gift_cards_create_multiple_quantity(
     ]
 
     # when
-    gift_cards = gift_cards_create(
-        order, lines_data, site_settings, staff_user, None, manager
-    )
+    with django_capture_on_commit_callbacks(execute=True):
+        gift_cards = gift_cards_create(
+            order, lines_data, site_settings, staff_user, None, manager
+        )
 
     # then
-    flush_post_commit_hooks()
     assert len(gift_cards) == quantity
     price = gift_card_non_shippable_order_line.unit_price_gross
     for gift_card in gift_cards:
@@ -401,6 +412,89 @@ def test_gift_cards_create_multiple_quantity(
 
     assert GiftCardEvent.objects.filter(type=GiftCardEvents.BOUGHT).count() == quantity
     assert send_notification_mock.call_count == quantity
+
+
+@freeze_time("2022-05-12 12:00:00")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+@patch("saleor.giftcard.utils.send_gift_card_notification")
+def test_gift_cards_create_trigger_webhook(
+    send_notification_mock,
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    webhook_app,
+    settings,
+    order,
+    gift_card_shippable_order_line,
+    gift_card_non_shippable_order_line,
+    site_settings,
+    staff_user,
+    django_capture_on_commit_callbacks,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    manager = get_plugins_manager(allow_replica=False)
+    line_1, line_2 = gift_card_shippable_order_line, gift_card_non_shippable_order_line
+    fulfillment = order.fulfillments.create(tracking_number="123")
+    fulfillment_line_1 = fulfillment.lines.create(
+        order_line=line_1,
+        quantity=line_1.quantity,
+        stock=line_1.allocations.get().stock,
+    )
+    fulfillment_line_2 = fulfillment.lines.create(
+        order_line=line_2,
+        quantity=line_2.quantity,
+        stock=line_2.allocations.get().stock,
+    )
+    lines_data = [
+        GiftCardLineData(
+            quantity=1,
+            order_line=line_1,
+            variant=line_1.variant,
+            fulfillment_line=fulfillment_line_1,
+        ),
+        GiftCardLineData(
+            quantity=1,
+            order_line=line_2,
+            variant=line_2.variant,
+            fulfillment_line=fulfillment_line_2,
+        ),
+    ]
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        gift_cards = gift_cards_create(
+            order, lines_data, site_settings, staff_user, None, manager
+        )
+
+    # then
+    assert len(gift_cards) == len(lines_data)
+
+    gift_card = gift_cards[-1]
+    gift_card_global_id = graphene.Node.to_global_id("GiftCard", gift_card.id)
+
+    mocked_webhook_trigger.assert_called_with(
+        json.dumps(
+            {
+                "id": gift_card_global_id,
+                "is_active": True,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(),
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.GIFT_CARD_CREATED,
+        [any_webhook],
+        gift_card,
+        None,
+        allow_replica=False,
+    )
+
+    send_notification_mock.assert_called()
 
 
 def test_get_gift_card_lines(
@@ -477,7 +571,7 @@ def test_fulfill_non_shippable_gift_cards(
     warehouse,
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     order_lines = [gift_card_shippable_order_line, gift_card_non_shippable_order_line]
 
     # when
@@ -487,7 +581,7 @@ def test_fulfill_non_shippable_gift_cards(
 
     # then
     fulfillment_lines_for_warehouses = {
-        str(warehouse.pk): [
+        warehouse.pk: [
             {
                 "order_line": gift_card_non_shippable_order_line,
                 "quantity": gift_card_non_shippable_order_line.quantity,
@@ -517,7 +611,7 @@ def test_fulfill_non_shippable_gift_cards_line_with_allocation(
     warehouse,
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     order_lines = [gift_card_shippable_order_line, gift_card_non_shippable_order_line]
 
     order = gift_card_non_shippable_order_line.order
@@ -533,7 +627,7 @@ def test_fulfill_non_shippable_gift_cards_line_with_allocation(
     )
 
     fulfillment_lines_for_warehouses = {
-        str(stock.warehouse.pk): [
+        stock.warehouse.pk: [
             {
                 "order_line": gift_card_non_shippable_order_line,
                 "quantity": gift_card_non_shippable_order_line.quantity,
@@ -557,9 +651,10 @@ def test_fulfill_gift_card_lines(
     gift_card_non_shippable_order_line,
     gift_card_shippable_order_line,
     site_settings,
+    django_capture_on_commit_callbacks,
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     order = gift_card_non_shippable_order_line.order
     non_shippable_variant = gift_card_non_shippable_order_line.variant
     non_shippable_variant.track_inventory = True
@@ -573,14 +668,14 @@ def test_fulfill_gift_card_lines(
     )
 
     # when
-    fulfillments = fulfill_gift_card_lines(
-        lines, staff_user, None, order, site_settings, manager
-    )
+    with django_capture_on_commit_callbacks(execute=True):
+        fulfillments = fulfill_gift_card_lines(
+            lines, staff_user, None, order, site_settings, manager
+        )
 
     # then
     assert len(fulfillments) == 1
     assert fulfillments[0].lines.count() == len(lines)
-    flush_post_commit_hooks()
     gift_cards = GiftCard.objects.all()
     assert gift_cards.count() == sum([line.quantity for line in lines])
     shippable_gift_cards = gift_cards.filter(
@@ -601,6 +696,11 @@ def test_fulfill_gift_card_lines(
         assert card.fulfillment_line
         assert GiftCardEvent.objects.filter(gift_card=card, type=GiftCardEvents.BOUGHT)
 
+    event = order.events.filter(type=OrderEvents.FULFILLMENT_FULFILLED_ITEMS).first()
+    assert event
+    assert "auto" in event.parameters
+    assert event.parameters["auto"] is True
+
 
 def test_fulfill_gift_card_lines_lack_of_stock(
     staff_user,
@@ -609,7 +709,7 @@ def test_fulfill_gift_card_lines_lack_of_stock(
     site_settings,
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     order = gift_card_non_shippable_order_line.order
     gift_card_non_shippable_order_line.variant.stocks.all().delete()
 
@@ -737,7 +837,9 @@ def test_is_gift_card_expired_never_expired_gift_card(gift_card):
 
 def test_is_gift_card_expired_true(gift_card):
     # given
-    gift_card.expiry_date = date.today() - timedelta(days=1)
+    gift_card.expiry_date = datetime.datetime.now(
+        tz=datetime.UTC
+    ).date() - datetime.timedelta(days=1)
     gift_card.save(update_fields=["expiry_date"])
 
     # when
@@ -748,7 +850,8 @@ def test_is_gift_card_expired_true(gift_card):
 
 
 @pytest.mark.parametrize(
-    "expiry_date", [timezone.now().date(), timezone.now().date() + timedelta(days=1)]
+    "expiry_date",
+    [timezone.now().date(), timezone.now().date() + datetime.timedelta(days=1)],
 )
 def test_is_gift_card_expired_false(expiry_date, gift_card):
     # given

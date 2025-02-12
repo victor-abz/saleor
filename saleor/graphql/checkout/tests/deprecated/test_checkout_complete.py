@@ -74,29 +74,33 @@ def test_checkout_complete(
     address,
     shipping_method,
 ):
-
+    # given
     assert not gift_card.last_used_on
 
     checkout = checkout_with_gift_card
     checkout.shipping_address = address
     checkout.shipping_method = shipping_method
     checkout.billing_address = address
-    checkout.store_value_in_metadata(items={"accepted": "true"})
-    checkout.store_value_in_private_metadata(items={"accepted": "false"})
+    checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
+    checkout.metadata_storage.store_value_in_private_metadata(
+        items={"accepted": "false"}
+    )
     checkout.save()
+    checkout.metadata_storage.save()
 
     checkout_line = checkout.lines.first()
     checkout_line_quantity = checkout_line.quantity
     checkout_line_variant = checkout_line.variant
 
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
-    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+    checkout_info = fetch_checkout_info(checkout, lines, manager)
     total = calculations.calculate_checkout_total_with_gift_cards(
         manager, checkout_info, lines, address
     )
-    site_settings.automatically_confirm_all_new_orders = True
-    site_settings.save()
+    channel = checkout.channel
+    channel.automatically_confirm_all_new_orders = True
+    channel.save()
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -110,8 +114,11 @@ def test_checkout_complete(
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
     redirect_url = "https://www.example.com"
     variables = {"checkoutId": checkout_id, "redirectUrl": redirect_url}
+
+    # when
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
 
+    # then
     content = get_graphql_content(response)
     data = content["data"]["checkoutComplete"]
     assert not data["errors"]
@@ -125,8 +132,8 @@ def test_checkout_complete(
     assert str(order.id) == order_token
     assert order.redirect_url == redirect_url
     assert order.total.gross == total.gross
-    assert order.metadata == checkout.metadata
-    assert order.private_metadata == checkout.private_metadata
+    assert order.metadata == checkout.metadata_storage.metadata
+    assert order.private_metadata == checkout.metadata_storage.private_metadata
 
     order_line = order.lines.first()
     assert checkout_line_quantity == order_line.quantity
@@ -142,10 +149,10 @@ def test_checkout_complete(
     assert gift_card.current_balance == zero_money(gift_card.currency)
     assert gift_card.last_used_on
 
-    assert not Checkout.objects.filter(
-        pk=checkout.pk
-    ).exists(), "Checkout should have been deleted"
-    order_confirmed_mock.assert_called_once_with(order)
+    assert not Checkout.objects.filter(pk=checkout.pk).exists(), (
+        "Checkout should have been deleted"
+    )
+    order_confirmed_mock.assert_called_once_with(order, webhooks=set())
 
 
 def test_checkout_complete_order_already_exists_neither_token_and_id_given(
@@ -239,22 +246,26 @@ def test_checkout_complete_for_token_as_input(
     checkout.shipping_address = address
     checkout.shipping_method = shipping_method
     checkout.billing_address = address
-    checkout.store_value_in_metadata(items={"accepted": "true"})
-    checkout.store_value_in_private_metadata(items={"accepted": "false"})
+    checkout.metadata_storage.store_value_in_metadata(items={"accepted": "true"})
+    checkout.metadata_storage.store_value_in_private_metadata(
+        items={"accepted": "false"}
+    )
     checkout.save()
+    checkout.metadata_storage.save()
 
     checkout_line = checkout.lines.first()
     checkout_line_quantity = checkout_line.quantity
     checkout_line_variant = checkout_line.variant
 
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
-    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+    checkout_info = fetch_checkout_info(checkout, lines, manager)
     total = calculations.calculate_checkout_total_with_gift_cards(
         manager, checkout_info, lines, address
     )
-    site_settings.automatically_confirm_all_new_orders = True
-    site_settings.save()
+    channel = checkout.channel
+    channel.automatically_confirm_all_new_orders = True
+    channel.save()
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -285,8 +296,8 @@ def test_checkout_complete_for_token_as_input(
     assert str(order.id) == order_token
     assert order.redirect_url == redirect_url
     assert order.total.gross == total.gross
-    assert order.metadata == checkout.metadata
-    assert order.private_metadata == checkout.private_metadata
+    assert order.metadata == checkout.metadata_storage.metadata
+    assert order.private_metadata == checkout.metadata_storage.private_metadata
 
     order_line = order.lines.first()
     assert checkout_line_quantity == order_line.quantity
@@ -302,7 +313,7 @@ def test_checkout_complete_for_token_as_input(
     assert gift_card.current_balance == zero_money(gift_card.currency)
     assert gift_card.last_used_on
 
-    assert not Checkout.objects.filter(
-        pk=checkout.pk
-    ).exists(), "Checkout should have been deleted"
-    order_confirmed_mock.assert_called_once_with(order)
+    assert not Checkout.objects.filter(pk=checkout.pk).exists(), (
+        "Checkout should have been deleted"
+    )
+    order_confirmed_mock.assert_called_once_with(order, webhooks=set())

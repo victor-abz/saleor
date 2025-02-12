@@ -1,5 +1,3 @@
-from typing import Dict, List, Optional
-
 import braintree as braintree_sdk
 import opentracing
 import opentracing.tags
@@ -28,8 +26,8 @@ ERROR_CODES_WHITELIST = {
 }
 
 
-def get_billing_data(payment_information: PaymentData) -> Dict:
-    billing: Dict[str, str] = {}
+def get_billing_data(payment_information: PaymentData) -> dict:
+    billing: dict[str, str] = {}
     if payment_information.billing:
         billing_info = payment_information.billing
         billing = {
@@ -46,7 +44,7 @@ def get_billing_data(payment_information: PaymentData) -> Dict:
     return billing
 
 
-def get_customer_data(payment_information: PaymentData) -> Dict:
+def get_customer_data(payment_information: PaymentData) -> dict:
     """Provide customer info, use only for new customer creation."""
     return {
         "order_id": payment_information.graphql_payment_id,
@@ -56,7 +54,7 @@ def get_customer_data(payment_information: PaymentData) -> Dict:
     }
 
 
-def get_error_for_client(errors: List) -> str:
+def get_error_for_client(errors: list) -> str:
     """Filter all error messages and decides which one is visible for the client."""
     if not errors:
         return ""
@@ -67,9 +65,9 @@ def get_error_for_client(errors: List) -> str:
     return default_msg
 
 
-def extract_gateway_response(braintree_result) -> Dict:
+def extract_gateway_response(braintree_result) -> dict:
     """Extract data from Braintree response that will be stored locally."""
-    errors: List[Optional[Dict[str, str]]] = []
+    errors: list[dict[str, str] | None] = []
     if not braintree_result.is_success:
         errors = [
             {"code": error.code, "message": error.message}
@@ -109,7 +107,7 @@ def get_braintree_gateway(
 
 
 def get_client_token(
-    config: GatewayConfig, token_config: Optional[TokenConfig] = None
+    config: GatewayConfig, token_config: TokenConfig | None = None
 ) -> str:
     gateway = get_braintree_gateway(**config.connection_params)
     with opentracing.global_tracer().start_active_span(
@@ -123,7 +121,7 @@ def get_client_token(
 
 
 def create_token_params(
-    config: GatewayConfig, token_config: Optional[TokenConfig] = None
+    config: GatewayConfig, token_config: TokenConfig | None = None
 ) -> dict:
     params = {}
     if "merchant_account_id" in config.connection_params:
@@ -319,8 +317,8 @@ def refund(payment_information: PaymentData, config: GatewayConfig) -> GatewayRe
                 transaction_id=payment_information.token,
                 amount_or_options=str(payment_information.amount),
             )
-    except braintree_sdk.exceptions.NotFoundError:
-        raise BraintreeException(DEFAULT_ERROR_MESSAGE)
+    except braintree_sdk.exceptions.NotFoundError as e:
+        raise BraintreeException(DEFAULT_ERROR_MESSAGE) from e
 
     gateway_response = extract_gateway_response(result)
     error = get_error_for_client(gateway_response["errors"])
@@ -348,7 +346,7 @@ def process_payment(
 
 def list_client_sources(
     config: GatewayConfig, customer_id: str
-) -> List[CustomerSource]:
+) -> list[CustomerSource]:
     gateway = get_braintree_gateway(**config.connection_params)
     with opentracing.global_tracer().start_active_span(
         "braintree.customer.find"

@@ -1,10 +1,11 @@
-from datetime import timedelta
+import datetime
 
 import pytest
 from django.utils import timezone
+from freezegun import freeze_time
 
 from .....discount import DiscountValueType
-from .....discount.models import Voucher
+from .....discount.models import Voucher, VoucherCode
 from ....tests.utils import get_graphql_content
 
 QUERY_VOUCHERS_WITH_FILTER = """
@@ -23,12 +24,12 @@ QUERY_VOUCHERS_WITH_FILTER = """
 
 
 @pytest.mark.parametrize(
-    "voucher_filter, start_date, end_date, count",
+    ("voucher_filter", "start_date", "end_date", "count"),
     [
         (
             {"status": "ACTIVE"},
             timezone.now().replace(year=2015, month=1, day=1),
-            timezone.now() + timedelta(days=365),
+            timezone.now() + datetime.timedelta(days=365),
             2,
         ),
         (
@@ -39,8 +40,8 @@ QUERY_VOUCHERS_WITH_FILTER = """
         ),
         (
             {"status": "SCHEDULED"},
-            timezone.now() + timedelta(days=3),
-            timezone.now() + timedelta(days=10),
+            timezone.now() + datetime.timedelta(days=3),
+            timezone.now() + datetime.timedelta(days=10),
             1,
         ),
     ],
@@ -53,19 +54,23 @@ def test_query_vouchers_with_filter_status(
     staff_api_client,
     permission_manage_discounts,
 ):
-    Voucher.objects.bulk_create(
+    vouchers = Voucher.objects.bulk_create(
         [
             Voucher(
                 name="Voucher1",
-                code="abc",
                 start_date=timezone.now(),
             ),
             Voucher(
                 name="Voucher2",
-                code="123",
                 start_date=start_date,
                 end_date=end_date,
             ),
+        ]
+    )
+    VoucherCode.objects.bulk_create(
+        [
+            VoucherCode(code="abc", voucher=vouchers[0]),
+            VoucherCode(code="123", voucher=vouchers[1]),
         ]
     )
     variables = {"filter": voucher_filter}
@@ -78,7 +83,7 @@ def test_query_vouchers_with_filter_status(
 
 
 @pytest.mark.parametrize(
-    "voucher_filter, count",
+    ("voucher_filter", "count"),
     [
         ({"timesUsed": {"gte": 1, "lte": 5}}, 1),
         ({"timesUsed": {"lte": 3}}, 2),
@@ -91,10 +96,16 @@ def test_query_vouchers_with_filter_times_used(
     staff_api_client,
     permission_manage_discounts,
 ):
-    Voucher.objects.bulk_create(
+    vouchers = Voucher.objects.bulk_create(
         [
-            Voucher(name="Voucher1", code="abc"),
-            Voucher(name="Voucher2", code="123", used=2),
+            Voucher(name="Voucher1"),
+            Voucher(name="Voucher2"),
+        ]
+    )
+    VoucherCode.objects.bulk_create(
+        [
+            VoucherCode(code="abc", voucher=vouchers[0]),
+            VoucherCode(code="123", used=2, voucher=vouchers[1]),
         ]
     )
     variables = {"filter": voucher_filter}
@@ -107,7 +118,7 @@ def test_query_vouchers_with_filter_times_used(
 
 
 @pytest.mark.parametrize(
-    "voucher_filter, count",
+    ("voucher_filter", "count"),
     [
         ({"started": {"gte": "2019-04-18T00:00:00+00:00"}}, 1),
         ({"started": {"lte": "2012-01-14T00:00:00+00:00"}}, 1),
@@ -129,16 +140,22 @@ def test_query_vouchers_with_filter_started(
     staff_api_client,
     permission_manage_discounts,
 ):
-    Voucher.objects.bulk_create(
+    vouchers = Voucher.objects.bulk_create(
         [
-            Voucher(name="Voucher1", code="abc"),
+            Voucher(name="Voucher1"),
             Voucher(
                 name="Voucher2",
-                code="123",
                 start_date=timezone.now().replace(year=2012, month=1, day=5),
             ),
         ]
     )
+    VoucherCode.objects.bulk_create(
+        [
+            VoucherCode(code="abc", voucher=vouchers[0]),
+            VoucherCode(code="123", voucher=vouchers[1]),
+        ]
+    )
+
     variables = {"filter": voucher_filter}
     response = staff_api_client.post_graphql(
         QUERY_VOUCHERS_WITH_FILTER, variables, permissions=[permission_manage_discounts]
@@ -149,7 +166,7 @@ def test_query_vouchers_with_filter_started(
 
 
 @pytest.mark.parametrize(
-    "voucher_filter, count, discount_value_type",
+    ("voucher_filter", "count", "discount_value_type"),
     [
         ({"discountType": "PERCENTAGE"}, 1, DiscountValueType.PERCENTAGE),
         ({"discountType": "FIXED"}, 2, DiscountValueType.FIXED),
@@ -162,18 +179,22 @@ def test_query_vouchers_with_filter_discount_type(
     staff_api_client,
     permission_manage_discounts,
 ):
-    Voucher.objects.bulk_create(
+    vouchers = Voucher.objects.bulk_create(
         [
             Voucher(
                 name="Voucher1",
-                code="abc",
                 discount_value_type=DiscountValueType.FIXED,
             ),
             Voucher(
                 name="Voucher2",
-                code="123",
                 discount_value_type=discount_value_type,
             ),
+        ]
+    )
+    VoucherCode.objects.bulk_create(
+        [
+            VoucherCode(code="abc", voucher=vouchers[0]),
+            VoucherCode(code="123", voucher=vouchers[1]),
         ]
     )
     variables = {"filter": voucher_filter}
@@ -186,7 +207,7 @@ def test_query_vouchers_with_filter_discount_type(
 
 
 @pytest.mark.parametrize(
-    "voucher_filter, count", [({"search": "Big"}, 1), ({"search": "GIFT"}, 2)]
+    ("voucher_filter", "count"), [({"search": "Big"}, 1), ({"search": "GIFT"}, 2)]
 )
 def test_query_vouchers_with_filter_search(
     voucher_filter,
@@ -194,10 +215,16 @@ def test_query_vouchers_with_filter_search(
     staff_api_client,
     permission_manage_discounts,
 ):
-    Voucher.objects.bulk_create(
+    vouchers = Voucher.objects.bulk_create(
         [
-            Voucher(name="The Biggest Voucher", code="GIFT"),
-            Voucher(name="Voucher2", code="GIFT-COUPON"),
+            Voucher(name="The Biggest Voucher"),
+            Voucher(name="Voucher2"),
+        ]
+    )
+    VoucherCode.objects.bulk_create(
+        [
+            VoucherCode(code="GIFT", voucher=vouchers[0]),
+            VoucherCode(code="GIFT-COUPON", voucher=vouchers[1]),
         ]
     )
     variables = {"filter": voucher_filter}
@@ -205,5 +232,98 @@ def test_query_vouchers_with_filter_search(
         QUERY_VOUCHERS_WITH_FILTER, variables, permissions=[permission_manage_discounts]
     )
     content = get_graphql_content(response)
+    data = content["data"]["vouchers"]["edges"]
+    assert len(data) == count
+
+
+@freeze_time("2020-03-18 12:00:00")
+@pytest.mark.parametrize(
+    ("start_date", "end_date", "used", "count"),
+    [
+        (
+            timezone.now().replace(year=2018, month=1, day=1),
+            timezone.now().replace(year=2019, month=1, day=1),
+            0,
+            2,
+        ),
+        (
+            timezone.now().replace(year=2023, month=1, day=1),
+            timezone.now().replace(year=2024, month=1, day=1),
+            0,
+            0,
+        ),
+        (
+            timezone.now().replace(year=2023, month=1, day=1),
+            None,
+            0,
+            0,
+        ),
+        (
+            timezone.now().replace(year=2019, month=1, day=1),
+            timezone.now().replace(year=2021, month=1, day=1),
+            0,
+            0,
+        ),
+        (
+            timezone.now().replace(year=2019, month=1, day=1),
+            timezone.now().replace(year=2021, month=1, day=1),
+            2,
+            1,
+        ),
+        (
+            timezone.now().replace(year=2019, month=1, day=1),
+            timezone.now().replace(year=2021, month=1, day=1),
+            110,
+            2,
+        ),
+    ],
+)
+def test_query_vouchers_with_filter_status_expired(
+    start_date,
+    end_date,
+    used,
+    count,
+    staff_api_client,
+    permission_manage_discounts,
+):
+    # given
+    vouchers = Voucher.objects.bulk_create(
+        [
+            Voucher(
+                name="Voucher1",
+                start_date=timezone.now(),
+            ),
+            Voucher(
+                name="Voucher2",
+                start_date=start_date,
+                end_date=end_date,
+                usage_limit=5,
+            ),
+            Voucher(
+                name="Voucher3",
+                start_date=start_date,
+                end_date=end_date,
+                usage_limit=100,
+            ),
+        ]
+    )
+    VoucherCode.objects.bulk_create(
+        [
+            VoucherCode(code="code-A", voucher=vouchers[0]),
+            VoucherCode(code="code-B", voucher=vouchers[0]),
+            VoucherCode(code="code-1", voucher=vouchers[1], used=3),
+            VoucherCode(code="code-2", voucher=vouchers[1], used=used),
+            VoucherCode(code="code-abc", voucher=vouchers[2], used=used),
+        ]
+    )
+    variables = {"filter": {"status": "EXPIRED"}}
+
+    # whne
+    response = staff_api_client.post_graphql(
+        QUERY_VOUCHERS_WITH_FILTER, variables, permissions=[permission_manage_discounts]
+    )
+    content = get_graphql_content(response)
+
+    # then
     data = content["data"]["vouchers"]["edges"]
     assert len(data) == count

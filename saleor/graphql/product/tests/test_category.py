@@ -1,16 +1,18 @@
 import json
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import graphene
 import pytest
 from django.core.files import File
+from django.utils import timezone
 from django.utils.functional import SimpleLazyObject
 from django.utils.text import slugify
 from freezegun import freeze_time
 from graphql_relay import to_global_id
 
 from ....core.utils.json_serializer import CustomJsonEncoder
+from ....discount.utils.promotion import get_active_catalogue_promotion_rules
 from ....product.error_codes import ProductErrorCode
 from ....product.models import Category, Product, ProductChannelListing
 from ....product.tests.utils import create_image, create_zip_file_with_image_ext
@@ -19,7 +21,7 @@ from ....tests.utils import dummy_editorjs
 from ....thumbnail.models import Thumbnail
 from ....webhook.event_types import WebhookEventAsyncType
 from ....webhook.payloads import generate_meta, generate_requestor
-from ...core.enums import ThumbnailFormatEnum
+from ...core.enums import LanguageCodeEnum, ThumbnailFormatEnum
 from ...tests.utils import (
     get_graphql_content,
     get_graphql_content_from_response,
@@ -27,10 +29,11 @@ from ...tests.utils import (
 )
 
 QUERY_CATEGORY = """
-    query ($id: ID, $slug: String, $channel: String){
+    query ($id: ID, $slug: String, $channel: String, $slugLanguageCode: LanguageCodeEnum){
         category(
             id: $id,
             slug: $slug,
+            slugLanguageCode: $slugLanguageCode
         ) {
             id
             name
@@ -76,6 +79,28 @@ def test_category_query_by_id(user_api_client, product, channel_USD):
     assert len(category_data["children"]["edges"]) == category.get_children().count()
 
 
+def test_category_query_with_ancestors(user_api_client, product, channel_USD):
+    # given
+    category = Category.objects.first()
+    child = Category.objects.create(
+        name="Child Category", slug="child-category", parent=category
+    )
+
+    # when
+    variables = {
+        "id": graphene.Node.to_global_id("Category", child.pk),
+        "channel": channel_USD.slug,
+    }
+    response = user_api_client.post_graphql(QUERY_CATEGORY, variables=variables)
+    content = get_graphql_content(response)
+    category_data = content["data"]["category"]
+
+    # then
+    assert category_data is not None
+    assert len(category_data["ancestors"]["edges"]) == child.get_ancestors().count()
+    assert len(category_data["children"]["edges"]) == child.get_children().count()
+
+
 def test_category_query_invalid_id(user_api_client, product, channel_USD):
     category_id = "'"
     variables = {
@@ -85,7 +110,10 @@ def test_category_query_invalid_id(user_api_client, product, channel_USD):
     response = user_api_client.post_graphql(QUERY_CATEGORY, variables)
     content = get_graphql_content_from_response(response)
     assert len(content["errors"]) == 1
-    assert content["errors"][0]["message"] == f"Couldn't resolve id: {category_id}."
+    assert (
+        content["errors"][0]["message"]
+        == f"Invalid ID: {category_id}. Expected: Category."
+    )
     assert content["data"]["category"] is None
 
 
@@ -203,6 +231,21 @@ def test_category_query_by_slug(user_api_client, product, channel_USD):
     assert category_data["name"] == category.name
     assert len(category_data["ancestors"]["edges"]) == category.get_ancestors().count()
     assert len(category_data["children"]["edges"]) == category.get_children().count()
+
+
+def test_category_query_by_translated_slug(
+    user_api_client, category, category_translation_with_slug_pl, channel_USD
+):
+    variables = {
+        "slug": category_translation_with_slug_pl.slug,
+        "channel": channel_USD.slug,
+        "slugLanguageCode": LanguageCodeEnum.PL.name,
+    }
+    response = user_api_client.post_graphql(QUERY_CATEGORY, variables=variables)
+    content = get_graphql_content(response)
+    data = content["data"]["category"]
+    assert data is not None
+    assert data["name"] == category.name
 
 
 def test_category_query_error_when_id_and_slug_provided(
@@ -404,6 +447,8 @@ def test_category_create_mutation(
     monkeypatch, staff_api_client, permission_manage_products, media_root
 ):
     # given
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
     category_name = "Test category"
     description = "description"
     category_slug = slugify(category_name)
@@ -427,9 +472,7 @@ def test_category_create_mutation(
     body = get_multipart_request_body(
         CATEGORY_CREATE_MUTATION, variables, image_file, image_name
     )
-    response = staff_api_client.post_multipart(
-        body, permissions=[permission_manage_products]
-    )
+    response = staff_api_client.post_multipart(body)
     content = get_graphql_content(response)
     data = content["data"]["categoryCreate"]
 
@@ -478,6 +521,8 @@ def test_category_create_trigger_webhook(
     media_root,
     settings,
 ):
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
     query = CATEGORY_CREATE_MUTATION
     mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
@@ -498,9 +543,7 @@ def test_category_create_trigger_webhook(
         "slug": category_slug,
     }
     body = get_multipart_request_body(query, variables, image_file, image_name)
-    response = staff_api_client.post_multipart(
-        body, permissions=[permission_manage_products]
-    )
+    response = staff_api_client.post_multipart(body)
     content = get_graphql_content(response)
     data = content["data"]["categoryCreate"]
     category = Category.objects.first()
@@ -524,17 +567,18 @@ def test_category_create_trigger_webhook(
         [any_webhook],
         category,
         SimpleLazyObject(lambda: staff_api_client.user),
+        allow_replica=False,
     )
 
 
 @pytest.mark.parametrize(
-    "input_slug, expected_slug",
-    (
+    ("input_slug", "expected_slug"),
+    [
         ("test-slug", "test-slug"),
         (None, "test-category"),
         ("", "test-category"),
         ("わたし-わ-にっぽん-です", "わたし-わ-にっぽん-です"),
-    ),
+    ],
 )
 def test_create_category_with_given_slug(
     staff_api_client, permission_manage_products, input_slug, expected_slug
@@ -610,10 +654,11 @@ MUTATION_CATEGORY_UPDATE_MUTATION = """
                 id
                 name
                 description
+                updatedAt
                 parent {
                     id
                 }
-                backgroundImage{
+                backgroundImage(size: 0) {
                     alt
                     url
                 }
@@ -631,6 +676,7 @@ def test_category_update_mutation(
     monkeypatch, staff_api_client, category, permission_manage_products, media_root
 ):
     # given
+    staff_api_client.user.user_permissions.add(permission_manage_products)
 
     # create child category and test that the update mutation won't change
     # it's parent
@@ -668,9 +714,7 @@ def test_category_update_mutation(
     )
 
     # when
-    response = staff_api_client.post_multipart(
-        body, permissions=[permission_manage_products]
-    )
+    response = staff_api_client.post_multipart(body)
     content = get_graphql_content(response)
     data = content["data"]["categoryUpdate"]
 
@@ -690,6 +734,75 @@ def test_category_update_mutation(
     assert category.private_metadata == {metadata_key: metadata_value, **old_meta}
 
 
+def test_category_update_mutation_marks_prices_to_recalculate(
+    staff_api_client, category, permission_manage_products, catalogue_promotion, product
+):
+    # given
+    product.category = category
+    product.save()
+
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    metadata_key = "md key"
+    metadata_value = "md value"
+
+    category_id = graphene.Node.to_global_id("Category", category.pk)
+    variables = {
+        "id": category_id,
+        "name": "Updated name",
+        "slug": "slug",
+        "metadata": [{"key": metadata_key, "value": metadata_value}],
+    }
+    # when
+    response = staff_api_client.post_graphql(
+        MUTATION_CATEGORY_UPDATE_MUTATION,
+        variables,
+    )
+
+    # then
+    get_graphql_content(response)
+    assert not catalogue_promotion.rules.filter(variants_dirty=False).exists()
+
+
+@freeze_time("2023-09-01 12:00:00")
+def test_category_update_mutation_with_update_at_field(
+    monkeypatch, staff_api_client, category, permission_manage_products, media_root
+):
+    # given
+    query = MUTATION_CATEGORY_UPDATE_MUTATION
+
+    # create child category and test that the update mutation won't change
+    # it's parent
+    child_category = category.children.create(name="child")
+
+    category_name = "Updated name"
+    description = "description"
+    category_slug = slugify(category_name)
+    category_description = dummy_editorjs(description, True)
+
+    category_id = graphene.Node.to_global_id("Category", child_category.pk)
+    variables = {
+        "name": category_name,
+        "description": category_description,
+        "id": category_id,
+        "slug": category_slug,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    content = get_graphql_content(response)
+    data = content["data"]["categoryUpdate"]
+
+    # then
+    assert data["category"]["id"] == category_id
+    assert data["category"]["name"] == category_name
+    assert data["category"]["description"] == category_description
+    assert data["category"]["updatedAt"] == timezone.now().isoformat()
+
+
 @freeze_time("2022-05-12 12:00:00")
 @patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
@@ -704,6 +817,8 @@ def test_category_update_trigger_webhook(
     media_root,
     settings,
 ):
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
     mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
@@ -726,9 +841,7 @@ def test_category_update_trigger_webhook(
     body = get_multipart_request_body(
         MUTATION_CATEGORY_UPDATE_MUTATION, variables, image_file, image_name
     )
-    response = staff_api_client.post_multipart(
-        body, permissions=[permission_manage_products]
-    )
+    response = staff_api_client.post_multipart(body)
     content = get_graphql_content(response)
     data = content["data"]["categoryUpdate"]
     assert data["errors"] == []
@@ -749,6 +862,7 @@ def test_category_update_trigger_webhook(
         [any_webhook],
         category,
         SimpleLazyObject(lambda: staff_api_client.user),
+        allow_replica=False,
     )
 
 
@@ -763,6 +877,8 @@ def test_category_update_background_image_mutation(
     site_settings,
 ):
     # given
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
     alt_text = "Alt text for an image."
     background_mock = MagicMock(spec=File)
     background_mock.name = "image.jpg"
@@ -797,9 +913,7 @@ def test_category_update_background_image_mutation(
     )
 
     # when
-    response = staff_api_client.post_multipart(
-        body, permissions=[permission_manage_products]
-    )
+    response = staff_api_client.post_multipart(body)
 
     # then
     content = get_graphql_content(response)
@@ -820,7 +934,7 @@ def test_category_update_background_image_mutation(
 
 
 @patch("saleor.core.tasks.delete_from_storage_task.delay")
-def test_category_update_mutation_invalid_background_image(
+def test_category_update_mutation_invalid_background_image_content_type(
     delete_from_storage_task_mock,
     staff_api_client,
     category,
@@ -857,6 +971,58 @@ def test_category_update_mutation_invalid_background_image(
     data = content["data"]["categoryUpdate"]
     assert data["errors"][0]["field"] == "backgroundImage"
     assert data["errors"][0]["message"] == "Invalid file type."
+
+    # ensure that thumbnails for old background image hasn't been deleted
+    assert Thumbnail.objects.filter(category_id=category.id)
+    delete_from_storage_task_mock.assert_not_called()
+
+
+@patch("saleor.core.tasks.delete_from_storage_task.delay")
+def test_category_update_mutation_invalid_background_image(
+    delete_from_storage_task_mock,
+    monkeypatch,
+    staff_api_client,
+    category,
+    permission_manage_products,
+    media_root,
+):
+    # given
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    image_file, image_name = create_image()
+    image_alt = "Alt text for an image."
+
+    error_msg = "Test syntax error"
+    image_file_mock = Mock(side_effect=SyntaxError(error_msg))
+    monkeypatch.setattr(
+        "saleor.graphql.core.validators.file.Image.open", image_file_mock
+    )
+
+    size = 128
+    thumbnail_mock = MagicMock(spec=File)
+    thumbnail_mock.name = "thumbnail_image.jpg"
+    Thumbnail.objects.create(category=category, size=size, image=thumbnail_mock)
+
+    variables = {
+        "name": "new-name",
+        "slug": "new-slug",
+        "id": to_global_id("Category", category.id),
+        "backgroundImage": image_name,
+        "backgroundImageAlt": image_alt,
+        "isPublished": True,
+    }
+    body = get_multipart_request_body(
+        MUTATION_CATEGORY_UPDATE_MUTATION, variables, image_file, image_name
+    )
+
+    # when
+    response = staff_api_client.post_multipart(body)
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["categoryUpdate"]
+    assert data["errors"][0]["field"] == "backgroundImage"
+    assert error_msg in data["errors"][0]["message"]
 
     # ensure that thumbnails for old background image hasn't been deleted
     assert Thumbnail.objects.filter(category_id=category.id)
@@ -924,7 +1090,7 @@ UPDATE_CATEGORY_SLUG_MUTATION = """
 
 
 @pytest.mark.parametrize(
-    "input_slug, expected_slug, error_message",
+    ("input_slug", "expected_slug", "error_message"),
     [
         ("test-slug", "test-slug", None),
         ("", "", "Slug value cannot be blank."),
@@ -988,7 +1154,7 @@ def test_update_category_slug_exists(
 
 
 @pytest.mark.parametrize(
-    "input_slug, expected_slug, input_name, error_message, error_field",
+    ("input_slug", "expected_slug", "input_name", "error_message", "error_field"),
     [
         ("test-slug", "test-slug", "New name", None, None),
         ("", "", "New name", "Slug value cannot be blank.", "slug"),
@@ -1074,6 +1240,7 @@ def test_category_delete_mutation(
     delete_from_storage_task_mock,
     staff_api_client,
     category,
+    product_list,
     media_root,
     permission_manage_products,
 ):
@@ -1082,6 +1249,8 @@ def test_category_delete_mutation(
     thumbnail_mock.name = "thumbnail_image.jpg"
     Thumbnail.objects.create(category=category, size=128, image=thumbnail_mock)
     Thumbnail.objects.create(category=category, size=200, image=thumbnail_mock)
+
+    category.products.add(*product_list)
 
     category_id = category.id
 
@@ -1102,9 +1271,12 @@ def test_category_delete_mutation(
     assert not Thumbnail.objects.filter(category_id=category_id)
     assert delete_from_storage_task_mock.call_count == 2
 
+    for rule in get_active_catalogue_promotion_rules():
+        assert rule.variants_dirty is True
+
 
 @freeze_time("2022-05-12 12:00:00")
-@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@patch("saleor.product.utils.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_category_delete_trigger_webhook(
     mocked_webhook_trigger,
@@ -1144,6 +1316,7 @@ def test_category_delete_trigger_webhook(
         [any_webhook],
         category,
         SimpleLazyObject(lambda: staff_api_client.user),
+        allow_replica=False,
     )
 
 
@@ -1166,9 +1339,7 @@ def test_delete_category_with_background_image(
         category.refresh_from_db()
 
 
-@patch("saleor.product.utils.update_products_discounted_prices_task")
 def test_category_delete_mutation_for_categories_tree(
-    mock_update_products_discounted_prices_task,
     staff_api_client,
     categories_tree_with_published_products,
     permission_manage_products,
@@ -1189,13 +1360,6 @@ def test_category_delete_mutation_for_categories_tree(
     with pytest.raises(parent._meta.model.DoesNotExist):
         parent.refresh_from_db()
 
-    mock_update_products_discounted_prices_task.delay.assert_called_once()
-    (
-        _call_args,
-        call_kwargs,
-    ) = mock_update_products_discounted_prices_task.delay.call_args
-    assert set(call_kwargs["product_ids"]) == set(p.pk for p in product_list)
-
     product_channel_listings = ProductChannelListing.objects.filter(
         product__in=product_list
     )
@@ -1203,11 +1367,11 @@ def test_category_delete_mutation_for_categories_tree(
         assert product_channel_listing.is_published is False
         assert not product_channel_listing.published_at
     assert product_channel_listings.count() == 4
+    for rule in get_active_catalogue_promotion_rules():
+        assert rule.variants_dirty is True
 
 
-@patch("saleor.product.utils.update_products_discounted_prices_task")
 def test_category_delete_mutation_for_children_from_categories_tree(
-    mock_update_products_discounted_prices_task,
     staff_api_client,
     categories_tree_with_published_products,
     permission_manage_products,
@@ -1227,9 +1391,8 @@ def test_category_delete_mutation_for_children_from_categories_tree(
     with pytest.raises(child._meta.model.DoesNotExist):
         child.refresh_from_db()
 
-    mock_update_products_discounted_prices_task.delay.assert_called_once_with(
-        product_ids=[child_product.pk]
-    )
+    for rule in get_active_catalogue_promotion_rules():
+        assert rule.variants_dirty is True
 
     parent_product.refresh_from_db()
     assert parent_product.category
@@ -1428,7 +1591,7 @@ def test_category_image_query_with_size_thumbnail_url_returned(
     )
 
 
-def test_category_image_query_only_format_provided_original_image_returned(
+def test_category_image_query_zero_size_custom_format_provided_original_image_returned(
     user_api_client, non_default_category, media_root, site_settings
 ):
     # given
@@ -1446,6 +1609,7 @@ def test_category_image_query_only_format_provided_original_image_returned(
     variables = {
         "id": category_id,
         "format": format,
+        "size": 0,
     }
 
     # when
@@ -1461,7 +1625,7 @@ def test_category_image_query_only_format_provided_original_image_returned(
     assert data["backgroundImage"]["url"] == expected_url
 
 
-def test_category_image_query_no_size_value_original_image_returned(
+def test_category_image_query_zero_size_value_original_image_returned(
     user_api_client, non_default_category, media_root, site_settings
 ):
     # given
@@ -1476,6 +1640,7 @@ def test_category_image_query_no_size_value_original_image_returned(
     category_id = graphene.Node.to_global_id("Category", category.pk)
     variables = {
         "id": category_id,
+        "size": 0,
     }
 
     # when
@@ -1630,7 +1795,7 @@ QUERY_CATEGORIES_WITH_SORT = """
 
 
 @pytest.mark.parametrize(
-    "category_sort, result_order",
+    ("category_sort", "result_order"),
     [
         (
             {"field": "NAME", "direction": "ASC"},
@@ -1710,7 +1875,7 @@ def test_categories_query_with_sort(
 
 
 @pytest.mark.parametrize(
-    "category_filter, count",
+    ("category_filter", "count"),
     [
         ({"search": "slug_"}, 4),
         ({"search": "Category1"}, 1),

@@ -1,40 +1,43 @@
 import logging
+from collections.abc import Callable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 from ..account.models import User
 from ..app.models import App
 from ..core.prices import quantize_price
 from ..core.tracing import traced_atomic_transaction
 from ..order.events import (
-    event_transaction_capture_requested,
+    event_transaction_cancel_requested,
+    event_transaction_charge_requested,
     event_transaction_refund_requested,
-    event_transaction_void_requested,
 )
+from ..order.models import OrderGrantedRefund
 from ..payment.interface import (
     CustomerSource,
     PaymentGateway,
     RefundData,
     TransactionActionData,
 )
+from ..webhook.event_types import WebhookEventSyncType
+from ..webhook.utils import get_webhooks_for_event
 from . import GatewayError, PaymentError, TransactionAction, TransactionKind
-from .models import Payment, Transaction, TransactionItem
+from .models import Payment, Transaction, TransactionEvent, TransactionItem
 from .utils import (
     clean_authorize,
     clean_capture,
+    create_failed_transaction_event,
     create_payment_information,
     create_transaction,
     gateway_postprocess,
     get_already_processed_transaction_or_create_new_transaction,
+    recalculate_refundable_for_checkout,
     update_payment,
     validate_gateway_response,
 )
 
 if TYPE_CHECKING:
     from ..plugins.manager import PluginsManager
-
-UserType = Optional[User]
-AppType = Optional[App]
 
 logger = logging.getLogger(__name__)
 ERROR_MSG = "Oops! Something went wrong."
@@ -83,26 +86,33 @@ def with_locked_payment(fn: Callable) -> Callable:
 def request_charge_action(
     transaction: TransactionItem,
     manager: "PluginsManager",
-    charge_value: Optional[Decimal],
+    charge_value: Decimal | None,
+    request_event: TransactionEvent,
     channel_slug: str,
-    user: UserType,
-    app: AppType,
+    user: User | None,
+    app: App | None,
 ):
-
     if charge_value is None:
         charge_value = transaction.authorized_value
 
-    _request_payment_action(
+    transaction_action_data = _create_transaction_data(
         transaction=transaction,
-        manager=manager,
         action_type=TransactionAction.CHARGE,
         action_value=charge_value,
+        request_event=request_event,
+    )
+    _request_payment_action(
+        transaction_action_data=transaction_action_data,
+        manager=manager,
         channel_slug=channel_slug,
+        event_type=WebhookEventSyncType.TRANSACTION_CHARGE_REQUESTED,
+        transaction_request_func=manager.transaction_charge_requested,
+        plugin_func_name="transaction_charge_requested",
     )
     if order_id := transaction.order_id:
-        event_transaction_capture_requested(
+        event_transaction_charge_requested(
             order_id=order_id,
-            reference=transaction.reference,
+            reference=transaction.psp_reference or "",
             amount=quantize_price(charge_value, transaction.currency),
             user=user,
             app=app,
@@ -112,69 +122,136 @@ def request_charge_action(
 def request_refund_action(
     transaction: TransactionItem,
     manager: "PluginsManager",
-    refund_value: Optional[Decimal],
+    refund_value: Decimal | None,
+    request_event: TransactionEvent,
     channel_slug: str,
-    user: UserType,
-    app: AppType,
+    user: User | None,
+    app: App | None,
+    granted_refund: OrderGrantedRefund | None = None,
 ):
     if refund_value is None:
         refund_value = transaction.charged_value
 
-    _request_payment_action(
+    transaction_action_data = _create_transaction_data(
         transaction=transaction,
-        manager=manager,
         action_type=TransactionAction.REFUND,
         action_value=refund_value,
-        channel_slug=channel_slug,
+        request_event=request_event,
+        granted_refund=granted_refund,
     )
+    _request_payment_action(
+        transaction_action_data=transaction_action_data,
+        manager=manager,
+        channel_slug=channel_slug,
+        event_type=WebhookEventSyncType.TRANSACTION_REFUND_REQUESTED,
+        transaction_request_func=manager.transaction_refund_requested,
+        plugin_func_name="transaction_refund_requested",
+    )
+
     if order_id := transaction.order_id:
         event_transaction_refund_requested(
             order_id=order_id,
-            reference=transaction.reference,
+            reference=transaction.psp_reference or "",
             amount=quantize_price(refund_value, transaction.currency),
             user=user,
             app=app,
         )
 
 
-def request_void_action(
+def request_cancelation_action(
     transaction: TransactionItem,
     manager: "PluginsManager",
+    cancel_value: Decimal | None,
+    request_event: TransactionEvent,
     channel_slug: str,
-    user: UserType,
-    app: AppType,
+    user: User | None,
+    app: App | None,
+    action: str,
 ):
-    _request_payment_action(
+    transaction_action_data = _create_transaction_data(
         transaction=transaction,
-        manager=manager,
-        action_type=TransactionAction.VOID,
-        action_value=None,
-        channel_slug=channel_slug,
+        action_type=action,
+        action_value=cancel_value,
+        request_event=request_event,
     )
+    _request_payment_action(
+        transaction_action_data=transaction_action_data,
+        manager=manager,
+        channel_slug=channel_slug,
+        event_type=WebhookEventSyncType.TRANSACTION_CANCELATION_REQUESTED,
+        transaction_request_func=manager.transaction_cancelation_requested,
+        plugin_func_name="transaction_cancelation_requested",
+    )
+
     if order_id := transaction.order_id:
-        event_transaction_void_requested(
-            order_id=order_id, reference=transaction.reference, user=user, app=app
+        event_transaction_cancel_requested(
+            order_id=order_id,
+            reference=transaction.psp_reference or "",
+            user=user,
+            app=app,
         )
+
+
+def _create_transaction_data(
+    transaction: TransactionItem,
+    action_type: str,
+    action_value: Decimal | None,
+    request_event: TransactionEvent,
+    granted_refund: OrderGrantedRefund | None = None,
+):
+    app_owner = None
+    if transaction.app_id:
+        app_owner = cast(App, transaction.app)
+        if not app_owner.is_active or app_owner.removed_at:
+            app_owner = None
+
+    if not app_owner and transaction.app_identifier:
+        app_owner = App.objects.filter(
+            identifier=transaction.app_identifier,
+            removed_at__isnull=True,
+            is_active=True,
+        ).first()
+
+    return TransactionActionData(
+        transaction=transaction,
+        action_type=action_type,
+        action_value=action_value,
+        event=request_event,
+        transaction_app_owner=app_owner,
+        granted_refund=granted_refund,
+    )
 
 
 def _request_payment_action(
-    transaction: TransactionItem,
+    transaction_action_data: TransactionActionData,
     manager: "PluginsManager",
-    action_type: str,
-    action_value: Optional[Decimal],
     channel_slug: str,
+    event_type: str,
+    transaction_request_func: Callable[[TransactionActionData, str], None],
+    plugin_func_name: str,
 ):
-    payment_data = TransactionActionData(
-        transaction=transaction, action_type=action_type, action_value=action_value
+    transaction_request_event_active = manager.is_event_active_for_any_plugin(
+        plugin_func_name, channel_slug=channel_slug
     )
-    event_active = manager.is_event_active_for_any_plugin(
-        "transaction_action_request", channel_slug=channel_slug
-    )
-    if not event_active:
+    webhooks = None
+    if transaction_action_data.transaction_app_owner:
+        webhooks = get_webhooks_for_event(
+            event_type=event_type,
+            apps_ids=[transaction_action_data.transaction_app_owner.pk],
+        )
+    if not transaction_request_event_active and not webhooks:
+        recalculate_refundable_for_checkout(
+            transaction_action_data.transaction, transaction_action_data.event
+        )
+        create_failed_transaction_event(
+            transaction_action_data.event,
+            cause="No app or plugin is configured to handle payment action requests.",
+        )
         raise PaymentError(
             "No app or plugin is configured to handle payment action requests."
         )
-    manager.transaction_action_request(payment_data, channel_slug=channel_slug)
+
+    transaction_request_func(transaction_action_data, channel_slug)
 
 
 @raise_payment_error
@@ -186,9 +263,9 @@ def process_payment(
     token: str,
     manager: "PluginsManager",
     channel_slug: str,
-    customer_id: str = None,
+    customer_id: str | None = None,
     store_source: bool = False,
-    additional_data: Optional[dict] = None,
+    additional_data: dict | None = None,
 ) -> Transaction:
     payment_data = create_payment_information(
         payment=payment,
@@ -227,7 +304,7 @@ def authorize(
     token: str,
     manager: "PluginsManager",
     channel_slug: str,
-    customer_id: str = None,
+    customer_id: str | None = None,
     store_source: bool = False,
 ) -> Transaction:
     clean_authorize(payment)
@@ -264,8 +341,8 @@ def capture(
     payment: Payment,
     manager: "PluginsManager",
     channel_slug: str,
-    amount: Decimal = None,
-    customer_id: str = None,
+    amount: Decimal | None = None,
+    customer_id: str | None = None,
     store_source: bool = False,
 ) -> Transaction:
     if amount is None:
@@ -304,7 +381,7 @@ def refund(
     payment: Payment,
     manager: "PluginsManager",
     channel_slug: str,
-    amount: Decimal = None,
+    amount: Decimal | None = None,
     refund_data: Optional["RefundData"] = None,
 ) -> Transaction:
     if amount is None:
@@ -327,7 +404,7 @@ def refund(
         # for manual payment we just need to mark payment as a refunded
         return create_transaction(
             payment,
-            TransactionKind.REFUND,
+            kind=TransactionKind.REFUND,
             payment_information=payment_data,
             is_success=True,
         )
@@ -376,7 +453,7 @@ def confirm(
     payment: Payment,
     manager: "PluginsManager",
     channel_slug: str,
-    additional_data: Optional[dict] = None,
+    additional_data: dict | None = None,
 ) -> Transaction:
     txn = payment.transactions.filter(
         kind=TransactionKind.ACTION_TO_CONFIRM, is_success=True
@@ -411,14 +488,14 @@ def list_payment_sources(
     gateway: str,
     customer_id: str,
     manager: "PluginsManager",
-    channel_slug: str,
-) -> List["CustomerSource"]:
+    channel_slug: str | None,
+) -> list["CustomerSource"]:
     return manager.list_payment_sources(gateway, customer_id, channel_slug=channel_slug)
 
 
 def list_gateways(
-    manager: "PluginsManager", channel_slug: Optional[str] = None
-) -> List["PaymentGateway"]:
+    manager: "PluginsManager", channel_slug: str | None = None
+) -> list["PaymentGateway"]:
     return manager.list_payment_gateways(channel_slug=channel_slug)
 
 
@@ -439,8 +516,9 @@ def _fetch_gateway_response(fn, *args, **kwargs):
 
 
 def _get_past_transaction_token(
-    payment: Payment, kind: str  # for kind use "TransactionKind"
-) -> Optional[str]:
+    payment: Payment,
+    kind: str,  # for kind use "TransactionKind"
+) -> str:
     txn = payment.transactions.filter(kind=kind, is_success=True).last()
     if txn is None:
         raise PaymentError(f"Cannot find successful {kind} transaction.")
@@ -455,10 +533,10 @@ def _validate_refund_amount(payment: Payment, amount: Decimal):
 
 
 def payment_refund_or_void(
-    payment: Optional[Payment],
+    payment: Payment | None,
     manager: "PluginsManager",
-    channel_slug: Optional[str],
-    transaction_id: Optional[str] = None,
+    channel_slug: str | None,
+    transaction_id: str | None = None,
 ):
     if payment is None:
         return
@@ -486,13 +564,13 @@ def payment_refund_or_void(
 
 
 def _get_success_transaction(
-    kind: str, payment: Payment, transaction_id: Optional[str]
-):
+    kind: str, payment: Payment, transaction_id: str | None
+) -> None | Transaction:
     if not transaction_id:
         try:
             transaction_id = _get_past_transaction_token(payment, kind)
         except PaymentError:
-            return
+            return None
     return payment.transactions.filter(
         token=transaction_id,
         action_required=False,

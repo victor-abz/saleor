@@ -11,9 +11,11 @@ from ..plugin import AvataxPlugin
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 @patch("saleor.plugins.avatax.cache.set")
 def test_calculate_checkout_total_use_cache(
     mock_cache_set,
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -27,7 +29,7 @@ def test_calculate_checkout_total_use_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -42,10 +44,11 @@ def test_calculate_checkout_total_use_cache(
         )
     )
     monkeypatch.setattr("saleor.plugins.avatax.cache.get", mocked_cache)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_total(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
 
     # when
@@ -57,7 +60,9 @@ def test_calculate_checkout_total_use_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 def test_calculate_checkout_total_save_avatax_response_in_cache(
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -71,7 +76,7 @@ def test_calculate_checkout_total_save_avatax_response_in_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -80,13 +85,14 @@ def test_calculate_checkout_total_save_avatax_response_in_cache(
         return_value=avalara_response_for_checkout_with_items_and_shipping
     )
     monkeypatch.setattr("saleor.plugins.avatax.api_post_request", mocked_avalara)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_total(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
     manager.calculate_checkout_total(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
     # Second Avatax call to make sure that we use cached response
 
@@ -100,9 +106,11 @@ def test_calculate_checkout_total_save_avatax_response_in_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 @patch("saleor.plugins.avatax.cache.set")
 def test_calculate_checkout_subtotal_use_cache(
     mock_cache_set,
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -116,7 +124,7 @@ def test_calculate_checkout_subtotal_use_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -131,10 +139,11 @@ def test_calculate_checkout_subtotal_use_cache(
         )
     )
     monkeypatch.setattr("saleor.plugins.avatax.cache.get", mocked_cache)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_subtotal(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
 
     # when
@@ -146,7 +155,9 @@ def test_calculate_checkout_subtotal_use_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 def test_calculate_checkout_subtotal_save_avatax_response_in_cache(
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -160,7 +171,7 @@ def test_calculate_checkout_subtotal_save_avatax_response_in_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -169,13 +180,14 @@ def test_calculate_checkout_subtotal_save_avatax_response_in_cache(
         return_value=avalara_response_for_checkout_with_items_and_shipping
     )
     monkeypatch.setattr("saleor.plugins.avatax.api_post_request", mocked_avalara)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_subtotal(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
     manager.calculate_checkout_subtotal(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
     # Second Avatax call to make sure that we use cached response
 
@@ -189,9 +201,11 @@ def test_calculate_checkout_subtotal_save_avatax_response_in_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 @patch("saleor.plugins.avatax.cache.set")
 def test_calculate_checkout_shipping_use_cache(
     mock_cache_set,
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -205,7 +219,7 @@ def test_calculate_checkout_shipping_use_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -220,10 +234,11 @@ def test_calculate_checkout_shipping_use_cache(
         )
     )
     monkeypatch.setattr("saleor.plugins.avatax.cache.get", mocked_cache)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_shipping(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
 
     # when
@@ -235,7 +250,9 @@ def test_calculate_checkout_shipping_use_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 def test_calculate_checkout_shipping_save_avatax_response_in_cache(
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -249,7 +266,7 @@ def test_calculate_checkout_shipping_save_avatax_response_in_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -258,13 +275,14 @@ def test_calculate_checkout_shipping_save_avatax_response_in_cache(
         return_value=avalara_response_for_checkout_with_items_and_shipping
     )
     monkeypatch.setattr("saleor.plugins.avatax.api_post_request", mocked_avalara)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_shipping(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
     manager.calculate_checkout_shipping(
-        checkout_info, lines, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_info.shipping_address
     )
     # Second Avatax call to make sure that we use cached response
 
@@ -278,9 +296,11 @@ def test_calculate_checkout_shipping_save_avatax_response_in_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 @patch("saleor.plugins.avatax.cache.set")
 def test_calculate_checkout_line_total_use_cache(
     mock_cache_set,
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -294,7 +314,7 @@ def test_calculate_checkout_line_total_use_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -310,10 +330,14 @@ def test_calculate_checkout_line_total_use_cache(
         )
     )
     monkeypatch.setattr("saleor.plugins.avatax.cache.get", mocked_cache)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_line_total(
-        checkout_info, lines, checkout_line_info, checkout_info.shipping_address, []
+        checkout_info,
+        lines,
+        checkout_line_info,
+        checkout_info.shipping_address,
     )
 
     # when
@@ -325,7 +349,9 @@ def test_calculate_checkout_line_total_use_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 def test_calculate_checkout_line_save_avatax_response_in_cache(
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -339,7 +365,7 @@ def test_calculate_checkout_line_save_avatax_response_in_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -349,13 +375,14 @@ def test_calculate_checkout_line_save_avatax_response_in_cache(
         return_value=avalara_response_for_checkout_with_items_and_shipping
     )
     monkeypatch.setattr("saleor.plugins.avatax.api_post_request", mocked_avalara)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_line_total(
-        checkout_info, lines, checkout_line_info, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_line_info, checkout_info.shipping_address
     )
     manager.calculate_checkout_line_total(
-        checkout_info, lines, checkout_line_info, checkout_info.shipping_address, []
+        checkout_info, lines, checkout_line_info, checkout_info.shipping_address
     )
     # Second Avatax call to make sure that we use cached response
 
@@ -369,9 +396,11 @@ def test_calculate_checkout_line_save_avatax_response_in_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 @patch("saleor.plugins.avatax.cache.set")
 def test_calculate_checkout_line_unit_price_use_cache(
     mock_cache_set,
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -385,7 +414,7 @@ def test_calculate_checkout_line_unit_price_use_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -401,6 +430,7 @@ def test_calculate_checkout_line_unit_price_use_cache(
         )
     )
     monkeypatch.setattr("saleor.plugins.avatax.cache.get", mocked_cache)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_line_unit_price(
@@ -408,7 +438,6 @@ def test_calculate_checkout_line_unit_price_use_cache(
         lines,
         checkout_line_info,
         checkout_info.shipping_address,
-        [],
     )
 
     # when
@@ -420,7 +449,9 @@ def test_calculate_checkout_line_unit_price_use_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 def test_calculate_checkout_line_unit_price_save_avatax_response_in_cache(
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -434,7 +465,7 @@ def test_calculate_checkout_line_unit_price_save_avatax_response_in_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -444,6 +475,7 @@ def test_calculate_checkout_line_unit_price_save_avatax_response_in_cache(
         return_value=avalara_response_for_checkout_with_items_and_shipping
     )
     monkeypatch.setattr("saleor.plugins.avatax.api_post_request", mocked_avalara)
+    mock_validate_tax_data.return_value = ""
 
     # then
     result = manager.calculate_checkout_line_unit_price(
@@ -451,14 +483,12 @@ def test_calculate_checkout_line_unit_price_save_avatax_response_in_cache(
         lines,
         checkout_line_info,
         checkout_info.shipping_address,
-        [],
     )
     manager.calculate_checkout_line_unit_price(
         checkout_info,
         lines,
         checkout_line_info,
         checkout_info.shipping_address,
-        [],
     )
     # Second Avatax call to make sure that we use cached response
 
@@ -472,9 +502,11 @@ def test_calculate_checkout_line_unit_price_save_avatax_response_in_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 @patch("saleor.plugins.avatax.cache.set")
 def test_get_checkout_line_tax_rate_use_cache(
     mock_cache_set,
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -488,7 +520,7 @@ def test_get_checkout_line_tax_rate_use_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -504,6 +536,7 @@ def test_get_checkout_line_tax_rate_use_cache(
         )
     )
     monkeypatch.setattr("saleor.plugins.avatax.cache.get", mocked_cache)
+    mock_validate_tax_data.return_value = ""
     fake_unit_price = TaxedMoney(net=Money("2", "USD"), gross=Money("10", "USD"))
 
     # then
@@ -512,7 +545,6 @@ def test_get_checkout_line_tax_rate_use_cache(
         lines,
         checkout_line_info,
         checkout_info.shipping_address,
-        [],
         fake_unit_price,
     )
 
@@ -525,7 +557,9 @@ def test_get_checkout_line_tax_rate_use_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 def test_get_checkout_line_tax_rate_save_avatax_response_in_cache(
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -539,7 +573,7 @@ def test_get_checkout_line_tax_rate_save_avatax_response_in_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -549,6 +583,7 @@ def test_get_checkout_line_tax_rate_save_avatax_response_in_cache(
         return_value=avalara_response_for_checkout_with_items_and_shipping
     )
     monkeypatch.setattr("saleor.plugins.avatax.api_post_request", mocked_avalara)
+    mock_validate_tax_data.return_value = ""
     fake_unit_price = TaxedMoney(net=Money("2", "USD"), gross=Money("10", "USD"))
 
     # then
@@ -557,7 +592,6 @@ def test_get_checkout_line_tax_rate_save_avatax_response_in_cache(
         lines,
         checkout_line_info,
         checkout_info.shipping_address,
-        [],
         fake_unit_price,
     )
     manager.get_checkout_line_tax_rate(
@@ -565,7 +599,6 @@ def test_get_checkout_line_tax_rate_save_avatax_response_in_cache(
         lines,
         checkout_line_info,
         checkout_info.shipping_address,
-        [],
         fake_unit_price,
     )
     # Second Avatax call to make sure that we use cached response
@@ -580,9 +613,11 @@ def test_get_checkout_line_tax_rate_save_avatax_response_in_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 @patch("saleor.plugins.avatax.cache.set")
 def test_get_checkout_shipping_tax_rate_use_cache(
     mock_cache_set,
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -596,7 +631,7 @@ def test_get_checkout_shipping_tax_rate_use_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -611,11 +646,12 @@ def test_get_checkout_shipping_tax_rate_use_cache(
         )
     )
     monkeypatch.setattr("saleor.plugins.avatax.cache.get", mocked_cache)
+    mock_validate_tax_data.return_value = ""
     fake_shipping_price = TaxedMoney(net=Money("2", "USD"), gross=Money("10", "USD"))
 
     # then
     result = manager.get_checkout_shipping_tax_rate(
-        checkout_info, lines, checkout_info.shipping_address, [], fake_shipping_price
+        checkout_info, lines, checkout_info.shipping_address, fake_shipping_price
     )
 
     # when
@@ -627,7 +663,9 @@ def test_get_checkout_shipping_tax_rate_use_cache(
 
 
 @override_settings(PLUGINS=["saleor.plugins.avatax.plugin.AvataxPlugin"])
+@patch("saleor.plugins.avatax.plugin.AvataxPlugin.validate_tax_data")
 def test_get_checkout_shipping_tax_rate_save_avatax_response_in_cache(
+    mock_validate_tax_data,
     checkout_with_items_and_shipping,
     checkout_with_items_and_shipping_info,
     address,
@@ -641,7 +679,7 @@ def test_get_checkout_shipping_tax_rate_save_avatax_response_in_cache(
     checkout = checkout_with_items_and_shipping
     checkout_info = checkout_with_items_and_shipping_info
     plugin_configuration()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     plugin = manager.get_plugin(AvataxPlugin.PLUGIN_ID, channel_USD.slug)
     site_settings.company_address = address
     site_settings.save()
@@ -650,14 +688,15 @@ def test_get_checkout_shipping_tax_rate_save_avatax_response_in_cache(
         return_value=avalara_response_for_checkout_with_items_and_shipping
     )
     monkeypatch.setattr("saleor.plugins.avatax.api_post_request", mocked_avalara)
+    mock_validate_tax_data.return_value = ""
     fake_shipping_price = TaxedMoney(net=Money("2", "USD"), gross=Money("10", "USD"))
 
     # then
     result = manager.get_checkout_shipping_tax_rate(
-        checkout_info, lines, checkout_info.shipping_address, [], fake_shipping_price
+        checkout_info, lines, checkout_info.shipping_address, fake_shipping_price
     )
     manager.get_checkout_shipping_tax_rate(
-        checkout_info, lines, checkout_info.shipping_address, [], fake_shipping_price
+        checkout_info, lines, checkout_info.shipping_address, fake_shipping_price
     )
     # Second Avatax call to make sure that we use cached response
 
