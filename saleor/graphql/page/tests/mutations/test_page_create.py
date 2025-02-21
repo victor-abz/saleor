@@ -1,8 +1,9 @@
-from datetime import datetime, timedelta
+import datetime
+from functools import partial
 from unittest import mock
+from unittest.mock import ANY
 
 import graphene
-import pytz
 from django.conf import settings
 from django.utils.functional import SimpleLazyObject
 from django.utils.text import slugify
@@ -12,7 +13,6 @@ from .....page.error_codes import PageErrorCode
 from .....page.models import Page, PageType
 from .....tests.utils import dummy_editorjs
 from .....webhook.event_types import WebhookEventAsyncType
-from .....webhook.payloads import generate_page_payload
 from ....tests.utils import get_graphql_content
 
 CREATE_PAGE_MUTATION = """
@@ -103,7 +103,10 @@ def test_page_create_mutation(staff_api_client, permission_manage_pages, page_ty
     assert data["page"]["content"] == page_content
     assert data["page"]["slug"] == page_slug
     assert data["page"]["isPublished"] == page_is_published
-    assert data["page"]["publishedAt"] == datetime.now(pytz.utc).isoformat()
+    assert (
+        data["page"]["publishedAt"]
+        == datetime.datetime.now(tz=datetime.UTC).isoformat()
+    )
     assert data["page"]["pageType"]["id"] == page_type_id
     values = (
         data["page"]["attributes"][0]["values"][0]["slug"],
@@ -121,7 +124,9 @@ def test_page_create_mutation_with_published_at_date(
     page_content = dummy_editorjs("test content", True)
     page_title = "test title"
     page_is_published = True
-    published_at = datetime.now(pytz.utc).replace(microsecond=0) + timedelta(days=5)
+    published_at = datetime.datetime.now(tz=datetime.UTC).replace(
+        microsecond=0
+    ) + datetime.timedelta(days=5)
     page_type_id = graphene.Node.to_global_id("PageType", page_type.pk)
 
     # Default attributes defined in product_type fixture
@@ -171,7 +176,6 @@ def test_page_create_mutation_with_published_at_date(
     assert tag_value_slug in values
 
 
-@freeze_time("1914-06-28 10:50")
 @mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_page_create_trigger_page_webhook(
@@ -214,14 +218,18 @@ def test_page_create_trigger_page_webhook(
     assert data["page"]["isPublished"] == page_is_published
     assert data["page"]["pageType"]["id"] == page_type_id
     page = Page.objects.first()
-    expected_data = generate_page_payload(page, staff_api_client.user)
 
     mocked_webhook_trigger.assert_called_once_with(
-        expected_data,
+        None,
         WebhookEventAsyncType.PAGE_CREATED,
         [any_webhook],
         page,
         SimpleLazyObject(lambda: staff_api_client.user),
+        legacy_data_generator=ANY,
+        allow_replica=False,
+    )
+    assert isinstance(
+        mocked_webhook_trigger.call_args.kwargs["legacy_data_generator"], partial
     )
 
 
@@ -688,7 +696,7 @@ def test_create_page_with_page_reference_attribute(
     assert page_type_page_reference_attribute.values.count() == values_count + 1
 
 
-@freeze_time(datetime(2020, 5, 5, 5, 5, 5, tzinfo=pytz.utc))
+@freeze_time(datetime.datetime(2020, 5, 5, 5, 5, 5, tzinfo=datetime.UTC))
 def test_create_page_with_date_attribute(
     staff_api_client,
     permission_manage_pages,
@@ -702,7 +710,7 @@ def test_create_page_with_date_attribute(
     page_title = "test title"
     page_type_id = graphene.Node.to_global_id("PageType", page_type.pk)
     date_attribute_id = graphene.Node.to_global_id("Attribute", date_attribute.id)
-    date_time_value = datetime.now(tz=pytz.utc)
+    date_time_value = datetime.datetime.now(tz=datetime.UTC)
     date_value = date_time_value.date()
 
     variables = {
@@ -748,7 +756,7 @@ def test_create_page_with_date_attribute(
     assert expected_attributes_data in data["page"]["attributes"]
 
 
-@freeze_time(datetime(2020, 5, 5, 5, 5, 5, tzinfo=pytz.utc))
+@freeze_time(datetime.datetime(2020, 5, 5, 5, 5, 5, tzinfo=datetime.UTC))
 def test_create_page_with_date_time_attribute(
     staff_api_client,
     permission_manage_pages,
@@ -764,7 +772,7 @@ def test_create_page_with_date_time_attribute(
     date_time_attribute_id = graphene.Node.to_global_id(
         "Attribute", date_time_attribute.id
     )
-    date_time_value = datetime.now(tz=pytz.utc)
+    date_time_value = datetime.datetime.now(tz=datetime.UTC)
     variables = {
         "input": {
             "title": page_title,

@@ -2,6 +2,7 @@ import hashlib
 from unittest.mock import patch
 
 import graphene
+import pytest
 from opentracing.mocktracer import MockTracer
 
 
@@ -19,6 +20,7 @@ def test_tracing_query_hashing(
     staff_api_client,
     permission_manage_products,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -34,8 +36,12 @@ def test_tracing_query_hashing(
         }
     """
     staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     hash = hashlib.md5(span.tags["graphql.query"].encode("utf-8")).hexdigest()
     assert span.tags["graphql.query_fingerprint"] == f"query:test:{hash}"
 
@@ -46,6 +52,7 @@ def test_tracing_query_hashing_with_fragment(
     staff_api_client,
     permission_manage_products,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -67,8 +74,12 @@ def test_tracing_query_hashing_with_fragment(
         }
     """
     staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     hash = hashlib.md5(span.tags["graphql.query"].encode("utf-8")).hexdigest()
     assert span.tags["graphql.query_fingerprint"] == f"query:test:{hash}"
 
@@ -79,6 +90,7 @@ def test_tracing_query_hashing_different_vars_same_checksum(
     staff_api_client,
     permission_manage_products,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -95,14 +107,16 @@ def test_tracing_query_hashing_different_vars_same_checksum(
     """
     staff_api_client.user.user_permissions.add(permission_manage_products)
     QUERIES = 5
+
+    # when
     for i in range(QUERIES):
         staff_api_client.post_graphql(query, {"first": i + 1})
-    fingerprints = list(
-        map(
-            lambda span: span.tags["graphql.query_fingerprint"],
-            _get_graphql_spans(tracer.finished_spans()),
-        )
-    )
+
+    # then
+    fingerprints = [
+        span.tags["graphql.query_fingerprint"]
+        for span in _get_graphql_spans(tracer.finished_spans())
+    ]
     assert len(fingerprints) == QUERIES
     assert len(set(fingerprints)) == 1
 
@@ -113,6 +127,7 @@ def test_tracing_query_hashing_unnamed_query(
     staff_api_client,
     permission_manage_products,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -128,8 +143,12 @@ def test_tracing_query_hashing_unnamed_query(
         }
     """
     staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     hash = hashlib.md5(span.tags["graphql.query"].encode("utf-8")).hexdigest()
     assert span.tags["graphql.query_fingerprint"] == f"query:{hash}"
 
@@ -140,6 +159,7 @@ def test_tracing_query_hashing_unnamed_query_no_query_spec(
     staff_api_client,
     permission_manage_products,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -155,8 +175,12 @@ def test_tracing_query_hashing_unnamed_query_no_query_spec(
         }
     """
     staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     hash = hashlib.md5(span.tags["graphql.query"].encode("utf-8")).hexdigest()
     assert span.tags["graphql.query_fingerprint"] == f"query:{hash}"
 
@@ -168,6 +192,7 @@ def test_tracing_mutation_hashing(
     permission_manage_orders,
     order_with_lines,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     order = order_with_lines
@@ -186,10 +211,14 @@ def test_tracing_mutation_hashing(
             }
         }
     """
+
+    # when
     staff_api_client.post_graphql(
         mutation, variables, permissions=[permission_manage_orders]
     )
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     hash = hashlib.md5(span.tags["graphql.query"].encode("utf-8")).hexdigest()
     assert span.tags["graphql.query_fingerprint"] == f"mutation:cancelOrder:{hash}"
 
@@ -200,6 +229,7 @@ def test_tracing_query_identifier_for_query(
     staff_api_client,
     permission_manage_products,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -256,8 +286,12 @@ def test_tracing_query_identifier_with_fragment(
         }
     """
     staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     assert span.tags["graphql.query_identifier"] == "products"
 
 
@@ -266,6 +300,7 @@ def test_tracing_query_identifier_for_unnamed_mutation(
     tracing_mock,
     staff_api_client,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -275,8 +310,12 @@ def test_tracing_query_identifier_for_unnamed_mutation(
           }
         }
     """
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     assert span.tags["graphql.query_identifier"] == "tokenCreate"
 
 
@@ -285,6 +324,7 @@ def test_tracing_query_identifier_for_named_mutation(
     tracing_mock,
     staff_api_client,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -294,8 +334,12 @@ def test_tracing_query_identifier_for_named_mutation(
           }
         }
     """
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     assert span.tags["graphql.query_identifier"] == "tokenCreate"
 
 
@@ -304,6 +348,7 @@ def test_tracing_query_identifier_for_many_mutations(
     tracing_mock,
     staff_api_client,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -320,8 +365,12 @@ def test_tracing_query_identifier_for_many_mutations(
         }
       }
     """
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     assert span.tags["graphql.query_identifier"] == "deleteWarehouse, tokenCreate"
 
 
@@ -331,6 +380,7 @@ def test_tracing_query_identifier_undefined(
     staff_api_client,
     permission_manage_products,
 ):
+    # given
     tracer = MockTracer()
     tracing_mock.return_value = tracer
     query = """
@@ -339,6 +389,127 @@ def test_tracing_query_identifier_undefined(
         }
     """
     staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    # when
     staff_api_client.post_graphql(query)
     span = _get_graphql_span(tracer.finished_spans())
+
+    # then
     assert span.tags["graphql.query_identifier"] == "undefined"
+
+
+@patch("saleor.graphql.views.opentracing.global_tracer")
+def test_tracing_dont_have_app_data_staff_as_requestor(
+    tracing_mock,
+    staff_api_client,
+    permission_manage_products,
+):
+    # given
+    tracer = MockTracer()
+    tracing_mock.return_value = tracer
+    query = """
+        query test {
+          products(first:5) {
+            edges{
+              node{
+                id
+                name
+              }
+            }
+          }
+        }
+    """
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    # when
+    staff_api_client.post_graphql(query)
+    span = _get_graphql_span(tracer.finished_spans())
+
+    # then
+    assert "app.name" not in span.tags
+    assert "app.id" not in span.tags
+
+
+@patch("saleor.graphql.views.opentracing.global_tracer")
+def test_tracing_have_app_data_app_as_requestor(
+    tracing_mock,
+    app_api_client,
+    permission_manage_products,
+):
+    # given
+    tracer = MockTracer()
+    tracing_mock.return_value = tracer
+    query = """
+        query test {
+          products(first:5) {
+            edges{
+              node{
+                id
+                name
+              }
+            }
+          }
+        }
+    """
+    app = app_api_client.app
+    app.permissions.add(permission_manage_products)
+
+    # when
+    app_api_client.post_graphql(query)
+    span = _get_graphql_span(tracer.finished_spans())
+
+    # then
+    assert span.tags["app.name"] == app.name
+    assert span.tags["app.id"] == app.id
+
+
+@pytest.mark.parametrize(
+    ("header_source", "expected_result"),
+    [
+        ("saleor.dashboard", "saleor.dashboard"),
+        ("saleor.dashboard.playground", "saleor.dashboard.playground"),
+        ("saleor.playground", "saleor.playground"),
+        ("saleor.DASHBOARD", "saleor.dashboard"),
+        ("SALEOR.dashboard", "saleor.dashboard"),
+        ("saleor.dashboard.Playground", "saleor.dashboard.playground"),
+        ("saleor.playgrounD", "saleor.playground"),
+        ("incorrect-value", "unknown_service"),
+        (None, "unknown_service"),
+    ],
+)
+@patch("saleor.graphql.views.opentracing.global_tracer")
+def test_tracing_have_source_service_name_set(
+    tracing_mock,
+    header_source,
+    expected_result,
+    app_api_client,
+    permission_manage_products,
+):
+    # given
+    tracer = MockTracer()
+    tracing_mock.return_value = tracer
+    query = """
+        query test {
+          products(first:5) {
+            edges{
+              node{
+                id
+                name
+              }
+            }
+          }
+        }
+    """
+    app = app_api_client.app
+    app.permissions.add(permission_manage_products)
+
+    # when
+    app_api_client.post_graphql(query, headers={"source-service-name": header_source})
+
+    # then
+    spans = list(
+        filter(lambda s: s.tags.get("source.service.name"), tracer.finished_spans())
+    )
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.tags["source.service.name"] == expected_result

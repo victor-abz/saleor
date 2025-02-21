@@ -2,8 +2,8 @@ import graphene
 from graphene.types.generic import GenericScalar
 
 from ...core.models import ModelWithMetadata
-from ..channel import ChannelContext
-from ..core.descriptions import ADDED_IN_33, PREVIEW_FEATURE
+from ..core import ResolveInfo
+from ..core.context import BaseContext
 from ..core.types import NonNullList
 from .resolvers import (
     check_private_metadata_privilege,
@@ -38,6 +38,39 @@ def _filter_metadata(metadata, keys):
     return {key: value for key, value in metadata.items() if key in keys}
 
 
+def _get_metadata_instance(
+    root: ModelWithMetadata | BaseContext[ModelWithMetadata],
+) -> ModelWithMetadata:
+    if isinstance(root, BaseContext):
+        return root.node
+    return root
+
+
+class MetadataDescription:
+    PRIVATE_METADATA = (
+        "List of private metadata items. Requires staff permissions to access."
+    )
+    PRIVATE_METAFIELD = (
+        "A single key from private metadata. "
+        "Requires staff permissions to access.\n\n"
+        "Tip: Use GraphQL aliases to fetch multiple keys."
+    )
+    PRIVATE_METAFIELDS = (
+        "Private metadata. Requires staff permissions to access. "
+        "Use `keys` to control which fields you want to include. "
+        "The default is to include everything."
+    )
+    METADATA = "List of public metadata items. Can be accessed without permissions."
+    METAFIELD = (
+        "A single key from public metadata.\n\n"
+        "Tip: Use GraphQL aliases to fetch multiple keys."
+    )
+    METAFIELDS = (
+        "Public metadata. Use `keys` to control which fields you want to include. "
+        "The default is to include everything."
+    )
+
+
 class ObjectWithMetadata(graphene.Interface):
     private_metadata = NonNullList(
         MetadataItem,
@@ -52,8 +85,6 @@ class ObjectWithMetadata(graphene.Interface):
             "A single key from private metadata. "
             "Requires staff permissions to access.\n\n"
             "Tip: Use GraphQL aliases to fetch multiple keys."
-            + ADDED_IN_33
-            + PREVIEW_FEATURE
         ),
     )
     private_metafields = Metadata(
@@ -61,7 +92,7 @@ class ObjectWithMetadata(graphene.Interface):
         description=(
             "Private metadata. Requires staff permissions to access. "
             "Use `keys` to control which fields you want to include. "
-            "The default is to include everything." + ADDED_IN_33 + PREVIEW_FEATURE
+            "The default is to include everything."
         ),
     )
     metadata = NonNullList(
@@ -76,48 +107,73 @@ class ObjectWithMetadata(graphene.Interface):
         description=(
             "A single key from public metadata.\n\n"
             "Tip: Use GraphQL aliases to fetch multiple keys."
-            + ADDED_IN_33
-            + PREVIEW_FEATURE
         ),
     )
     metafields = Metadata(
         args={"keys": NonNullList(graphene.String)},
         description=(
             "Public metadata. Use `keys` to control which fields you want to include. "
-            "The default is to include everything." + ADDED_IN_33 + PREVIEW_FEATURE
+            "The default is to include everything."
         ),
     )
 
     @staticmethod
-    def resolve_metadata(root: ModelWithMetadata, _info):
-        return resolve_metadata(root.metadata)
+    def resolve_metadata(
+        root: ModelWithMetadata | BaseContext[ModelWithMetadata], _info: ResolveInfo
+    ):
+        instance = _get_metadata_instance(root)
+        return resolve_metadata(instance.metadata)
 
     @staticmethod
-    def resolve_metafield(root: ModelWithMetadata, _info, *, key: str):
-        return root.metadata.get(key)
+    def resolve_metafield(
+        root: ModelWithMetadata | BaseContext[ModelWithMetadata],
+        _info: ResolveInfo,
+        *,
+        key: str,
+    ) -> str | None:
+        instance = _get_metadata_instance(root)
+        return instance.metadata.get(key)
 
     @staticmethod
-    def resolve_metafields(root: ModelWithMetadata, _info, *, keys=None):
-        return _filter_metadata(root.metadata, keys)
+    def resolve_metafields(root: ModelWithMetadata, _info: ResolveInfo, *, keys=None):
+        instance = _get_metadata_instance(root)
+        return _filter_metadata(instance.metadata, keys)
 
     @staticmethod
-    def resolve_private_metadata(root: ModelWithMetadata, info):
-        return resolve_private_metadata(root, info)
+    def resolve_private_metadata(
+        root: ModelWithMetadata | BaseContext[ModelWithMetadata], info: ResolveInfo
+    ):
+        instance = _get_metadata_instance(root)
+        return resolve_private_metadata(instance, info)
 
     @staticmethod
-    def resolve_private_metafield(root: ModelWithMetadata, info, *, key: str):
-        check_private_metadata_privilege(root, info)
-        return root.private_metadata.get(key)
+    def resolve_private_metafield(
+        root: ModelWithMetadata | BaseContext[ModelWithMetadata],
+        info: ResolveInfo,
+        *,
+        key: str,
+    ) -> str | None:
+        instance = _get_metadata_instance(root)
+        check_private_metadata_privilege(instance, info)
+        return instance.private_metadata.get(key)
 
     @staticmethod
-    def resolve_private_metafields(root: ModelWithMetadata, info, *, keys=None):
-        check_private_metadata_privilege(root, info)
-        return _filter_metadata(root.private_metadata, keys)
+    def resolve_private_metafields(
+        root: ModelWithMetadata | BaseContext[ModelWithMetadata],
+        info: ResolveInfo,
+        *,
+        keys=None,
+    ):
+        instance = _get_metadata_instance(root)
+        check_private_metadata_privilege(instance, info)
+        return _filter_metadata(instance.private_metadata, keys)
 
     @classmethod
-    def resolve_type(cls, instance: ModelWithMetadata, _info):
-        if isinstance(instance, ChannelContext):
-            # Return instance for types that use ChannelContext
-            instance = instance.node
+    def resolve_type(
+        cls,
+        instance: ModelWithMetadata | BaseContext[ModelWithMetadata],
+        info: ResolveInfo,
+    ):
+        instance = _get_metadata_instance(instance)
         item_type, _ = resolve_object_with_metadata_type(instance)
         return item_type

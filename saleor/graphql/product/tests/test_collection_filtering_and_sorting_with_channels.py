@@ -1,7 +1,7 @@
 import datetime
 
+import graphene
 import pytest
-import pytz
 
 from ....product.models import Collection, CollectionChannelListing
 from ...tests.utils import assert_graphql_error_with_message, get_graphql_content
@@ -34,13 +34,13 @@ def collections_for_sorting_with_channels(channel_USD, channel_PLN):
             ),
             CollectionChannelListing(
                 collection=collections[2],
-                published_at=datetime.datetime(2004, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2004, 1, 1, tzinfo=datetime.UTC),
                 is_published=False,
                 channel=channel_USD,
             ),
             CollectionChannelListing(
                 collection=collections[3],
-                published_at=datetime.datetime(2003, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2003, 1, 1, tzinfo=datetime.UTC),
                 is_published=False,
                 channel=channel_USD,
             ),
@@ -59,18 +59,19 @@ def collections_for_sorting_with_channels(channel_USD, channel_PLN):
             ),
             CollectionChannelListing(
                 collection=collections[2],
-                published_at=datetime.datetime(2002, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2002, 1, 1, tzinfo=datetime.UTC),
                 is_published=False,
                 channel=channel_PLN,
             ),
             CollectionChannelListing(
                 collection=collections[4],
-                published_at=datetime.datetime(2001, 1, 1, tzinfo=pytz.UTC),
+                published_at=datetime.datetime(2001, 1, 1, tzinfo=datetime.UTC),
                 is_published=False,
                 channel=channel_PLN,
             ),
         ]
     )
+    return collections
 
 
 QUERY_COLLECTIONS_WITH_SORTING_AND_FILTERING = """
@@ -120,7 +121,7 @@ def test_collections_with_sorting_and_without_channel(
 
 
 @pytest.mark.parametrize(
-    "sort_by, collections_order",
+    ("sort_by", "collections_order"),
     [
         (
             {"field": "AVAILABILITY", "direction": "ASC"},
@@ -167,7 +168,7 @@ def test_collections_with_sorting_and_channel_USD(
 
 
 @pytest.mark.parametrize(
-    "sort_by, collections_order",
+    ("sort_by", "collections_order"),
     [
         (
             {"field": "AVAILABILITY", "direction": "ASC"},
@@ -293,7 +294,7 @@ def test_collections_with_filtering_without_channel(
 
 
 @pytest.mark.parametrize(
-    "filter_by, collections_count",
+    ("filter_by", "collections_count"),
     [
         ({"published": "PUBLISHED"}, 1),
         ({"published": "HIDDEN"}, 3),
@@ -328,7 +329,7 @@ def test_collections_with_filtering_with_channel_USD(
 
 
 @pytest.mark.parametrize(
-    "filter_by, collections_count",
+    ("filter_by", "collections_count"),
     [({"published": "PUBLISHED"}, 1), ({"published": "HIDDEN"}, 3)],
 )
 def test_collections_with_filtering_with_channel_PLN(
@@ -386,3 +387,65 @@ def test_collections_with_filtering_and_not_existing_channel(
     content = get_graphql_content(response)
     collections_nodes = content["data"]["collections"]["edges"]
     assert len(collections_nodes) == 0
+
+
+COLLECTION_WHERE_QUERY = """
+    query($where: CollectionWhereInput!, $channel: String) {
+      collections(first: 10, where: $where, channel: $channel) {
+        edges {
+          node {
+            id
+            slug
+          }
+        }
+      }
+    }
+"""
+
+
+def test_collections_where_by_ids(api_client, collection_list, channel_USD):
+    # given
+    ids = [
+        graphene.Node.to_global_id("Collection", collection.pk)
+        for collection in collection_list[:2]
+    ]
+    variables = {"channel": channel_USD.slug, "where": {"AND": [{"ids": ids}]}}
+
+    # when
+    response = api_client.post_graphql(COLLECTION_WHERE_QUERY, variables)
+
+    # then
+    data = get_graphql_content(response)
+    collections = data["data"]["collections"]["edges"]
+    assert len(collections) == 2
+    returned_slugs = {node["node"]["slug"] for node in collections}
+    assert returned_slugs == {
+        collection_list[0].slug,
+        collection_list[1].slug,
+    }
+
+
+def test_collections_where_by_none_as_ids(api_client, collection_list, channel_USD):
+    # given
+    variables = {"channel": channel_USD.slug, "where": {"AND": [{"ids": None}]}}
+
+    # when
+    response = api_client.post_graphql(COLLECTION_WHERE_QUERY, variables)
+
+    # then
+    data = get_graphql_content(response)
+    collections = data["data"]["collections"]["edges"]
+    assert len(collections) == 0
+
+
+def test_collections_where_by_ids_empty_list(api_client, collection_list, channel_USD):
+    # given
+    variables = {"channel": channel_USD.slug, "where": {"ids": []}}
+
+    # when
+    response = api_client.post_graphql(COLLECTION_WHERE_QUERY, variables)
+
+    # then
+    data = get_graphql_content(response)
+    collections = data["data"]["collections"]["edges"]
+    assert len(collections) == 0

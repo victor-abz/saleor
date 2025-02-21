@@ -1,8 +1,7 @@
-from datetime import datetime, timedelta
+import datetime
 
 import graphene
 import pytest
-import pytz
 from django.utils import timezone
 from freezegun import freeze_time
 
@@ -28,8 +27,8 @@ query Products($sortBy: ProductOrder, $channel: String) {
 
 @freeze_time("2020-03-18 12:00:00")
 @pytest.mark.parametrize(
-    "direction, order_direction",
-    (("ASC", "publication_date"), ("DESC", "-publication_date")),
+    ("direction", "order_direction"),
+    [("ASC", "publication_date"), ("DESC", "-publication_date")],
 )
 def test_sort_products_by_publication_date(
     direction, order_direction, api_client, product_list, channel_USD
@@ -37,7 +36,7 @@ def test_sort_products_by_publication_date(
     product_channel_listings = []
     for iter_value, product in enumerate(product_list):
         product_channel_listing = product.channel_listings.get(channel=channel_USD)
-        product_channel_listing.published_at = timezone.now() - timedelta(
+        product_channel_listing.published_at = timezone.now() - datetime.timedelta(
             days=iter_value
         )
         product_channel_listings.append(product_channel_listing)
@@ -128,14 +127,12 @@ QUERY_PAGINATED_SORTED_PRODUCTS = """
 def test_pagination_for_sorting_products_by_publication_date(
     api_client, channel_USD, product_list
 ):
-    """Ensure that using the cursor in sorting products by publication date works
-    properly."""
     # given
     channel_listings = ProductChannelListing.objects.filter(channel_id=channel_USD.id)
     listings_in_bulk = {listing.product_id: listing for listing in channel_listings}
     for product in product_list:
         listing = listings_in_bulk.get(product.id)
-        listing.published_at = datetime.now(pytz.UTC)
+        listing.published_at = datetime.datetime.now(tz=datetime.UTC)
 
     ProductChannelListing.objects.bulk_update(channel_listings, ["published_at"])
 
@@ -197,8 +194,6 @@ QUERY_PAGINATED_SORTED_COLLECTIONS = """
 def test_pagination_for_sorting_collections_by_publication_date(
     api_client, channel_USD
 ):
-    """Ensure that using the cursor in sorting collections by publication date works
-    properly."""
     # given
     collections = Collection.objects.bulk_create(
         [
@@ -207,14 +202,14 @@ def test_pagination_for_sorting_collections_by_publication_date(
             Collection(name="Coll3", slug="collection-3"),
         ]
     )
-    now = datetime.now(pytz.UTC)
+    now = datetime.datetime.now(tz=datetime.UTC)
     CollectionChannelListing.objects.bulk_create(
         [
             CollectionChannelListing(
                 channel=channel_USD,
                 collection=collection,
                 is_published=True,
-                published_at=now - timedelta(days=num),
+                published_at=now - datetime.timedelta(days=num),
             )
             for num, collection in enumerate(collections)
         ]

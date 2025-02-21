@@ -6,7 +6,6 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("product", "0163_auto_20220414_1025"),
     ]
@@ -19,6 +18,7 @@ class Migration(migrations.Migration):
                 blank=True, null=True
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="product",
             index=django.contrib.postgres.indexes.GinIndex(

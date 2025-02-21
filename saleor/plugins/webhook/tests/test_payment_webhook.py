@@ -1,23 +1,30 @@
 import datetime
 import json
-from collections import namedtuple
+from typing import NamedTuple
 from unittest import mock
 
 import pytest
 from django.conf import settings
 from django.contrib.sites.models import Site
+from django.utils import timezone
 from requests import RequestException, TooManyRedirects
+from requests_hardened import HTTPSession
 
 from ....app.models import App
 from ....core import EventDeliveryStatus
 from ....core.models import EventDelivery, EventDeliveryAttempt, EventPayload
 from ....payment import PaymentError, TransactionKind
+from ....payment.interface import PaymentGateway
 from ....payment.utils import create_payment_information
 from ....webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ....webhook.models import Webhook, WebhookEvent
-from .. import signature_for_payload
-from ..tasks import send_webhook_request_sync, trigger_webhook_sync
-from ..utils import (
+from ....webhook.transport import signature_for_payload
+from ....webhook.transport.synchronous.transport import (
+    send_webhook_request_sync,
+    trigger_webhook_sync,
+)
+from ....webhook.transport.utils import (
+    from_payment_app_id,
     parse_list_payment_gateways_response,
     parse_payment_action_response,
     to_payment_app_id,
@@ -35,7 +42,23 @@ def payment_invalid_app(payment_dummy):
     return payment_dummy
 
 
-WebhookTestData = namedtuple("WebhookTestData", "secret, event_type, data, message")
+@pytest.fixture
+def payment_removed_app(payment_dummy):
+    app = App.objects.create(
+        name="Dummy app", is_active=True, removed_at=timezone.now()
+    )
+    gateway_id = "credit-card"
+    gateway = to_payment_app_id(app, gateway_id)
+    payment_dummy.gateway = gateway
+    payment_dummy.save()
+    return payment_dummy
+
+
+class WebhookTestData(NamedTuple):
+    secret: str
+    event_type: WebhookEventAsyncType
+    data: str
+    message: bytes
 
 
 @pytest.fixture
@@ -47,18 +70,20 @@ def webhook_data():
     return WebhookTestData(secret, event_type, data, message)
 
 
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_trigger_webhook_sync(mock_request, payment_app):
     data = '{"key": "value"}'
     trigger_webhook_sync(
-        WebhookEventSyncType.PAYMENT_CAPTURE, data, payment_app.webhooks.first()
+        WebhookEventSyncType.PAYMENT_CAPTURE, data, payment_app.webhooks.first(), False
     )
-    event_delivery = EventDelivery.objects.first()
-    mock_request.assert_called_once_with(payment_app.name, event_delivery)
+    mock_request.assert_called_once()
+    assert not EventDelivery.objects.exists()
 
 
-@mock.patch("saleor.plugins.webhook.tasks.create_delivery_for_subscription_sync_event")
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch(
+    "saleor.webhook.transport.synchronous.transport.create_delivery_for_subscription_sync_event"
+)
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_trigger_webhook_sync_with_subscription(
     mock_request,
     mock_delivery_create,
@@ -73,22 +98,16 @@ def test_trigger_webhook_sync_with_subscription(
         WebhookEventSyncType.PAYMENT_CAPTURE,
         data,
         payment_app.webhooks.first(),
+        False,
         payment,
     )
-    mock_request.assert_called_once_with(payment_app.name, fake_delivery)
+    mock_request.assert_called_once_with(fake_delivery)
 
 
-def test_trigger_webhook_sync_no_webhook_available():
-    app = App.objects.create(name="Dummy app", is_active=True)
-    # should raise an error for app with no payment webhooks
-    with pytest.raises(PaymentError):
-        trigger_webhook_sync(
-            WebhookEventSyncType.PAYMENT_REFUND, {}, app.webhooks.first()
-        )
-
-
-@mock.patch("saleor.plugins.webhook.tasks.observability.report_event_delivery_attempt")
-@mock.patch("saleor.plugins.webhook.tasks.requests.post")
+@mock.patch(
+    "saleor.webhook.transport.synchronous.transport.observability.report_event_delivery_attempt"
+)
+@mock.patch.object(HTTPSession, "request")
 def test_send_webhook_request_sync_failed_attempt(
     mock_post, mock_observability, app, event_delivery
 ):
@@ -105,7 +124,7 @@ def test_send_webhook_request_sync_failed_attempt(
     mock_post().status_code = expected_data["status_code"]
     mock_post().elapsed = expected_data["duration"]
     # when
-    response_data = send_webhook_request_sync(app.name, event_delivery)
+    response_data = send_webhook_request_sync(event_delivery)
     attempt = EventDeliveryAttempt.objects.first()
 
     # then
@@ -119,9 +138,9 @@ def test_send_webhook_request_sync_failed_attempt(
     mock_observability.assert_called_once_with(attempt)
 
 
-@mock.patch("saleor.plugins.webhook.tasks.observability.report_event_delivery_attempt")
-@mock.patch("saleor.plugins.webhook.tasks.requests.post")
-@mock.patch("saleor.plugins.webhook.tasks.clear_successful_delivery")
+@mock.patch("saleor.webhook.observability.report_event_delivery_attempt")
+@mock.patch.object(HTTPSession, "request")
+@mock.patch("saleor.webhook.transport.synchronous.transport.clear_successful_delivery")
 def test_send_webhook_request_sync_successful_attempt(
     mock_clear_delivery, mock_post, mock_observability, app, event_delivery
 ):
@@ -138,12 +157,14 @@ def test_send_webhook_request_sync_successful_attempt(
     mock_post().status_code = expected_data["status_code"]
     mock_post().elapsed = expected_data["duration"]
     # when
-    response_data = send_webhook_request_sync(app.name, event_delivery)
-
-    attempt = EventDeliveryAttempt.objects.first()
+    response_data = send_webhook_request_sync(event_delivery)
 
     # then
     mock_clear_delivery.assert_called_once_with(event_delivery)
+    mock_observability.assert_called_once()
+    assert not EventDeliveryAttempt.objects.exists()
+
+    attempt = mock_observability.mock_calls[0].args[0]
     assert event_delivery.status == EventDeliveryStatus.SUCCESS
     assert attempt.status == EventDeliveryStatus.SUCCESS
     assert attempt.duration == expected_data["duration"].total_seconds()
@@ -154,14 +175,14 @@ def test_send_webhook_request_sync_successful_attempt(
     mock_observability.assert_called_once_with(attempt)
 
 
-@mock.patch("saleor.plugins.webhook.tasks.observability.report_event_delivery_attempt")
-@mock.patch("saleor.plugins.webhook.tasks.requests.post", side_effect=RequestException)
+@mock.patch("saleor.webhook.observability.report_event_delivery_attempt")
+@mock.patch.object(HTTPSession, "request", side_effect=RequestException)
 def test_send_webhook_request_sync_request_exception(
     mock_post, mock_observability, app, event_delivery
 ):
     # given
     event_payload = event_delivery.payload
-    data = event_payload.payload
+    data = event_payload.get_payload()
     webhook = event_delivery.webhook
     domain = Site.objects.get_current().domain
     message = data.encode("utf-8")
@@ -171,7 +192,7 @@ def test_send_webhook_request_sync_request_exception(
     )
 
     # when
-    response_data = send_webhook_request_sync(app.name, event_delivery)
+    response_data = send_webhook_request_sync(event_delivery)
     attempt = EventDeliveryAttempt.objects.first()
 
     # then
@@ -186,8 +207,8 @@ def test_send_webhook_request_sync_request_exception(
     mock_observability.assert_called_once_with(attempt)
 
 
-@mock.patch("saleor.plugins.webhook.tasks.observability.report_event_delivery_attempt")
-@mock.patch("saleor.plugins.webhook.tasks.requests.post")
+@mock.patch("saleor.webhook.observability.report_event_delivery_attempt")
+@mock.patch.object(HTTPSession, "request")
 def test_send_webhook_request_sync_when_exception_with_response(
     mock_post, mock_observability, app, event_delivery
 ):
@@ -197,7 +218,7 @@ def test_send_webhook_request_sync_when_exception_with_response(
     mock_response.status_code = 302
     mock_post.side_effect = TooManyRedirects(response=mock_response)
     # when
-    send_webhook_request_sync(app.name, event_delivery)
+    send_webhook_request_sync(event_delivery)
     attempt = EventDeliveryAttempt.objects.first()
 
     # then
@@ -207,8 +228,8 @@ def test_send_webhook_request_sync_when_exception_with_response(
     mock_observability.assert_called_once_with(attempt)
 
 
-@mock.patch("saleor.plugins.webhook.tasks.observability.report_event_delivery_attempt")
-@mock.patch("saleor.plugins.webhook.tasks.requests.post")
+@mock.patch("saleor.webhook.observability.report_event_delivery_attempt")
+@mock.patch.object(HTTPSession, "request")
 def test_send_webhook_request_sync_json_parsing_error(
     mock_post, mock_observability, app, event_delivery
 ):
@@ -225,7 +246,7 @@ def test_send_webhook_request_sync_json_parsing_error(
     mock_post().status_code = expected_data["status_code"]
 
     # when
-    response_data = send_webhook_request_sync(app.name, event_delivery)
+    response_data = send_webhook_request_sync(event_delivery)
     attempt = EventDeliveryAttempt.objects.first()
 
     # then
@@ -239,32 +260,34 @@ def test_send_webhook_request_sync_json_parsing_error(
     mock_observability.assert_called_once_with(attempt)
 
 
-@mock.patch("saleor.plugins.webhook.tasks.requests.post")
+@mock.patch.object(HTTPSession, "request")
 def test_send_webhook_request_with_proper_timeout(mock_post, event_delivery, app):
     mock_post().text = '{"key": "response_text"}'
     mock_post().headers = {"header_key": "header_val"}
     mock_post().elapsed = datetime.timedelta(seconds=1)
     mock_post().status_code = 200
-    send_webhook_request_sync(app.name, event_delivery)
+    send_webhook_request_sync(event_delivery)
     assert mock_post.call_args.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
 
 def test_send_webhook_request_sync_invalid_scheme(webhook, app):
-    with pytest.raises(ValueError):
-        target_url = "gcpubsub://cloud.google.com/projects/saleor/topics/test"
-        event_payload = EventPayload.objects.create(payload="fake_content")
-        webhook.target_url = target_url
-        webhook.save()
-        delivery = EventDelivery.objects.create(
-            status="pending",
-            event_type=WebhookEventAsyncType.ANY,
-            payload=event_payload,
-            webhook=webhook,
-        )
-        send_webhook_request_sync(app.name, delivery)
+    target_url = "gcpubsub://cloud.google.com/projects/saleor/topics/test"
+    event_payload = EventPayload.objects.create_with_payload_file(
+        payload="fake_content"
+    )
+    webhook.target_url = target_url
+    webhook.save()
+    delivery = EventDelivery.objects.create(
+        status="pending",
+        event_type=WebhookEventAsyncType.ANY,
+        payload=event_payload,
+        webhook=webhook,
+    )
+    with pytest.raises(ValueError, match="Unknown webhook scheme"):
+        send_webhook_request_sync(delivery)
 
 
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_get_payment_gateways(
     mock_send_request, payment_app, permission_manage_payments, webhook_plugin
 ):
@@ -294,7 +317,7 @@ def test_get_payment_gateways(
         }
     ]
     mock_send_request.return_value = mock_json_response
-    response_data = plugin.get_payment_gateways("USD", None, None)
+    response_data = plugin.get_payment_gateways("USD", None, None, None)
     expected_response_1 = parse_list_payment_gateways_response(
         mock_json_response, payment_app
     )
@@ -306,7 +329,65 @@ def test_get_payment_gateways(
     assert response_data[1] == expected_response_2[0]
 
 
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
+def test_get_payment_gateways_with_transactions(
+    mock_send_request, permission_manage_payments, webhook_plugin
+):
+    # given
+    app_name = "Payment App 2"
+    app_identifier = "app2"
+    app = App.objects.create(name=app_name, is_active=True, identifier=app_identifier)
+    app.permissions.add(permission_manage_payments)
+    webhook = Webhook.objects.create(
+        name="payment-webhook-2",
+        app=app,
+        target_url="https://payment-gateway-2.com/api/",
+    )
+    WebhookEvent.objects.create(
+        event_type=WebhookEventSyncType.TRANSACTION_INITIALIZE_SESSION, webhook=webhook
+    )
+
+    plugin = webhook_plugin()
+
+    # when
+    response_data = plugin.get_payment_gateways("USD", None, None, None)
+
+    # then
+    assert len(response_data) == 1
+    assert response_data[0] == PaymentGateway(
+        id=app_identifier, name=app_name, currencies=["USD"], config=[]
+    )
+    assert not mock_send_request.called
+
+
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
+def test_get_payment_gateways_with_transactions_and_app_without_identifier(
+    mock_send_request, permission_manage_payments, webhook_plugin
+):
+    # given
+    app_name = "Payment App 2"
+    app_identifier = ""
+    app = App.objects.create(name=app_name, is_active=True, identifier=app_identifier)
+    app.permissions.add(permission_manage_payments)
+    webhook = Webhook.objects.create(
+        name="payment-webhook-2",
+        app=app,
+        target_url="https://payment-gateway-2.com/api/",
+    )
+    WebhookEvent.objects.create(
+        event_type=WebhookEventSyncType.TRANSACTION_INITIALIZE_SESSION, webhook=webhook
+    )
+
+    plugin = webhook_plugin()
+
+    # when
+    response_data = plugin.get_payment_gateways("USD", None, None, None)
+
+    # then
+    assert len(response_data) == 0
+
+
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_get_payment_gateways_multiple_webhooks_in_the_same_app(
     mock_send_request, payment_app, permission_manage_payments, webhook_plugin
 ):
@@ -336,7 +417,7 @@ def test_get_payment_gateways_multiple_webhooks_in_the_same_app(
     mock_send_request.return_value = mock_json_response
 
     # when
-    response_data = plugin.get_payment_gateways("USD", None, None)
+    response_data = plugin.get_payment_gateways("USD", None, None, None)
 
     # then
     expected_response_1 = parse_list_payment_gateways_response(
@@ -350,7 +431,7 @@ def test_get_payment_gateways_multiple_webhooks_in_the_same_app(
     assert response_data[1] == expected_response_2[0]
 
 
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_get_payment_gateways_filters_out_unsupported_currencies(
     mock_send_request, payment_app, webhook_plugin
 ):
@@ -364,14 +445,14 @@ def test_get_payment_gateways_filters_out_unsupported_currencies(
         }
     ]
     mock_send_request.return_value = mock_json_response
-    response_data = plugin.get_payment_gateways("PLN", None, None)
+    response_data = plugin.get_payment_gateways("PLN", None, None, None)
     assert response_data == []
 
 
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @mock.patch("saleor.plugins.webhook.plugin.generate_list_gateways_payload")
 def test_get_payment_gateways_for_checkout(
-    mock_generate_payload, mock_send_request, checkout, payment_app, webhook_plugin
+    mock_generate_payload, mock_send_request, checkout_info, payment_app, webhook_plugin
 ):
     plugin = webhook_plugin()
     mock_json_response = [
@@ -384,22 +465,22 @@ def test_get_payment_gateways_for_checkout(
     ]
     mock_send_request.return_value = mock_json_response
     mock_generate_payload.return_value = ""
-    plugin.get_payment_gateways("USD", checkout, None)
-    assert mock_generate_payload.call_args[0][1] == checkout
+    plugin.get_payment_gateways("USD", checkout_info, None, None)
+    assert mock_generate_payload.call_args[0][1] == checkout_info.checkout
 
 
 @pytest.mark.parametrize(
-    "txn_kind, plugin_func_name",
-    (
+    ("txn_kind", "plugin_func_name"),
+    [
         (TransactionKind.AUTH, "authorize_payment"),
         (TransactionKind.CAPTURE, "capture_payment"),
         (TransactionKind.REFUND, "refund_payment"),
         (TransactionKind.VOID, "void_payment"),
         (TransactionKind.CONFIRM, "confirm_payment"),
         (TransactionKind.CAPTURE, "process_payment"),
-    ),
+    ],
 )
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_run_payment_webhook(
     mock_send_request,
     txn_kind,
@@ -425,6 +506,42 @@ def test_run_payment_webhook(
 def test_run_payment_webhook_invalid_app(payment_invalid_app, webhook_plugin):
     plugin = webhook_plugin()
     payment_information = create_payment_information(payment_invalid_app, "token")
+    with pytest.raises(PaymentError):
+        plugin._WebhookPlugin__run_payment_webhook(
+            WebhookEventSyncType.PAYMENT_AUTHORIZE,
+            TransactionKind.AUTH,
+            payment_information,
+            None,
+        )
+
+
+def test_run_payment_webhook_removed_app_by_id(payment_removed_app, webhook_plugin):
+    # given
+    plugin = webhook_plugin()
+    payment_information = create_payment_information(payment_removed_app, "token")
+
+    # when
+    with pytest.raises(PaymentError):
+        plugin._WebhookPlugin__run_payment_webhook(
+            WebhookEventSyncType.PAYMENT_AUTHORIZE,
+            TransactionKind.AUTH,
+            payment_information,
+            None,
+        )
+
+
+def test_run_payment_webhook_removed_app_by_app_identifier(
+    payment, payment_app, webhook_plugin
+):
+    # given
+    payment_app.removed_at = timezone.now()
+    payment_app.save(update_fields=["removed_at"])
+    plugin = webhook_plugin()
+    payment_information = create_payment_information(payment, "token")
+    payment_data = from_payment_app_id(payment_information.gateway)
+    assert payment_data.app_identifier == payment_app.identifier
+
+    # when
     with pytest.raises(PaymentError):
         plugin._WebhookPlugin__run_payment_webhook(
             WebhookEventSyncType.PAYMENT_AUTHORIZE,
@@ -461,7 +578,7 @@ def test_run_payment_webhook_inactive_plugin(payment, webhook_plugin):
     assert response == dummy_previous_value
 
 
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_run_payment_webhook_no_response(mock_send_request, payment, webhook_plugin):
     # Should raise and error when response data is None.
     mock_send_request.return_value = None
@@ -476,7 +593,7 @@ def test_run_payment_webhook_no_response(mock_send_request, payment, webhook_plu
         )
 
 
-@mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 def test_run_payment_webhook_empty_response(mock_send_request, payment, webhook_plugin):
     # Empty JSON response "{}"" is accepted; check that it doesn't fail.
     mock_send_request.return_value = {}

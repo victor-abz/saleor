@@ -1,5 +1,6 @@
 from decimal import Decimal
 from operator import attrgetter
+from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
@@ -7,30 +8,34 @@ from django.contrib.postgres.indexes import GinIndex
 from django.core.serializers.json import DjangoJSONEncoder
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
-from django.db.models import JSONField  # type: ignore
+from django.db.models import JSONField
+from django.utils import timezone
 from django_prices.models import MoneyField
 from prices import Money
 
 from ..checkout.models import Checkout
 from ..core.models import ModelWithMetadata
-from ..core.permissions import PaymentPermissions
 from ..core.taxes import zero_money
+from ..permission.enums import PaymentPermissions
 from . import (
     ChargeStatus,
     CustomPaymentChoices,
     StorePaymentMethod,
     TransactionAction,
+    TransactionEventType,
     TransactionKind,
-    TransactionStatus,
 )
 
 
 class TransactionItem(ModelWithMetadata):
+    token = models.UUIDField(unique=True, default=uuid4)
+    use_old_id = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     modified_at = models.DateTimeField(auto_now=True)
-    status = models.CharField(max_length=512, blank=True, default="")
-    type = models.CharField(max_length=512, blank=True, default="")
-    reference = models.CharField(max_length=512, blank=True, default="")
+    idempotency_key = models.CharField(max_length=512, blank=True, null=True)
+    name = models.CharField(max_length=512, blank=True, null=True, default="")
+    message = models.CharField(max_length=512, blank=True, null=True, default="")
+    psp_reference = models.CharField(max_length=512, blank=True, null=True)
     available_actions = ArrayField(
         models.CharField(max_length=128, choices=TransactionAction.CHOICES),
         default=list,
@@ -60,12 +65,51 @@ class TransactionItem(ModelWithMetadata):
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
         default=Decimal("0"),
     )
-    amount_voided = MoneyField(amount_field="voided_value", currency_field="currency")
-    voided_value = models.DecimalField(
+    amount_canceled = MoneyField(
+        amount_field="canceled_value", currency_field="currency"
+    )
+    canceled_value = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
         default=Decimal("0"),
     )
+    amount_refund_pending = MoneyField(
+        amount_field="refund_pending_value", currency_field="currency"
+    )
+    refund_pending_value = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0"),
+    )
+
+    amount_charge_pending = MoneyField(
+        amount_field="charge_pending_value", currency_field="currency"
+    )
+    charge_pending_value = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0"),
+    )
+
+    amount_authorize_pending = MoneyField(
+        amount_field="authorize_pending_value", currency_field="currency"
+    )
+    authorize_pending_value = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0"),
+    )
+
+    cancel_pending_value = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0"),
+    )
+    amount_cancel_pending = MoneyField(
+        amount_field="cancel_pending_value", currency_field="currency"
+    )
+
+    external_url = models.URLField(blank=True, null=True)
 
     checkout = models.ForeignKey(
         Checkout,
@@ -79,32 +123,103 @@ class TransactionItem(ModelWithMetadata):
         null=True,
         on_delete=models.PROTECT,
     )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    # We store app and app_identifier, as the app field stores apps of
+    # all types (local, third-party), and the app_identifier field stores
+    # only third-party apps.
+    # In the case of re-installing the third-party app, we are able to match
+    # existing transactions with the re-installed app by using `app_identifier`.
+    app = models.ForeignKey(
+        "app.App",
+        related_name="+",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    app_identifier = models.CharField(blank=True, null=True, max_length=256)
+
+    # If last release funds action failed the flag will be set to False
+    # Used to define if the checkout with transaction is refundable or not.
+    # Set to False when automatic refund was triggered.
+    last_refund_success = models.BooleanField(default=True)
 
     class Meta:
         ordering = ("pk",)
         indexes = [
             *ModelWithMetadata.Meta.indexes,
-            # Orders filtering by status index
-            GinIndex(fields=["order_id", "status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["app_identifier", "idempotency_key"],
+                name="unique_transaction_idempotency",
+            ),
         ]
 
 
 class TransactionEvent(models.Model):
-    created_at = models.DateTimeField(auto_now_add=True)
-    status = models.CharField(
-        max_length=128,
-        choices=TransactionStatus.CHOICES,
-        default=TransactionStatus.SUCCESS,
-    )
-    reference = models.CharField(max_length=512, blank=True, default="")
-    name = models.CharField(max_length=512, blank=True, default="")
-
+    created_at = models.DateTimeField(default=timezone.now)
+    idempotency_key = models.CharField(max_length=512, blank=True, null=True)
+    psp_reference = models.CharField(max_length=512, blank=True, null=True)
+    message = models.CharField(max_length=512, blank=True, null=True, default="")
     transaction = models.ForeignKey(
         TransactionItem, related_name="events", on_delete=models.CASCADE
+    )
+    external_url = models.URLField(blank=True, null=True)
+    currency = models.CharField(max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH)
+    type = models.CharField(
+        max_length=128,
+        choices=TransactionEventType.CHOICES,
+        default=TransactionEventType.INFO,
+    )
+    amount = MoneyField(amount_field="amount_value", currency_field="currency")
+    amount_value = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0"),
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    # We store app and app_identifier, as the app field stores apps of
+    # all types (local, third-party), and the app_identifier field stores
+    # only third-party apps.
+    # In the case of re-installing the third-party app, we are able to match
+    # existing transactions with the re-installed app by using `app_identifier`.
+    app = models.ForeignKey(
+        "app.App", related_name="+", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    app_identifier = models.CharField(blank=True, null=True, max_length=256)
+
+    include_in_calculations = models.BooleanField(default=False)
+
+    related_granted_refund = models.ForeignKey(
+        "order.OrderGrantedRefund",
+        related_name="transaction_events",
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
     )
 
     class Meta:
         ordering = ("pk",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["transaction_id", "idempotency_key"],
+                name="unique_transaction_event_idempotency",
+            )
+        ]
 
 
 class Payment(ModelWithMetadata):
@@ -228,10 +343,8 @@ class Payment(ModelWithMetadata):
         # There is no authorized amount anymore when capture is succeeded
         # since capture can only be made once, even it is a partial capture
         if any(
-            [
-                txn.kind == TransactionKind.CAPTURE and txn.is_success
-                for txn in transactions
-            ]
+            txn.kind == TransactionKind.CAPTURE and txn.is_success
+            for txn in transactions
         ):
             return money
 
@@ -262,12 +375,10 @@ class Payment(ModelWithMetadata):
     @property
     def is_authorized(self):
         return any(
-            [
-                txn.kind == TransactionKind.AUTH
-                and txn.is_success
-                and not txn.action_required
-                for txn in self.transactions.all()
-            ]
+            txn.kind == TransactionKind.AUTH
+            and txn.is_success
+            and not txn.action_required
+            for txn in self.transactions.all()
         )
 
     @property
@@ -318,7 +429,9 @@ class Transaction(models.Model):
     action_required_data = JSONField(
         blank=True, default=dict, encoder=DjangoJSONEncoder
     )
-    currency = models.CharField(max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH)
+    currency = models.CharField(
+        max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH,
+    )
     amount = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
@@ -331,6 +444,12 @@ class Transaction(models.Model):
 
     class Meta:
         ordering = ("pk",)
+        indexes = [
+            GinIndex(
+                name="token_idx",
+                fields=["token"],
+            ),
+        ]
 
     def __repr__(self):
         return (

@@ -24,11 +24,11 @@ from ....tests.utils import get_graphql_content
 
 def assert_proper_webhook_called_once(order, status, draft_mock, order_mock):
     if status == OrderStatus.DRAFT:
-        draft_mock.assert_called_once_with(order)
+        draft_mock.assert_called_once_with(order, webhooks=set())
         order_mock.assert_not_called()
     else:
         draft_mock.assert_not_called()
-        order_mock.assert_called_once_with(order)
+        order_mock.assert_called_once_with(order, webhooks=set())
 
 
 QUERY_ORDER_TOTAL = """
@@ -47,24 +47,23 @@ query Orders($period: ReportingPeriod, $channel: String) {
 """
 
 
-def test_orders_total(staff_api_client, permission_manage_orders, order_with_lines):
+def test_orders_total(
+    staff_api_client, permission_group_manage_orders, order_with_lines
+):
     # given
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
     order = order_with_lines
     variables = {"period": ReportingPeriod.TODAY.name}
 
     # when
     with warnings.catch_warnings(record=True) as warns:
-        response = staff_api_client.post_graphql(
-            QUERY_ORDER_TOTAL, variables, permissions=[permission_manage_orders]
-        )
+        response = staff_api_client.post_graphql(QUERY_ORDER_TOTAL, variables)
         content = get_graphql_content(response)
 
     # then
     amount = str(content["data"]["ordersTotal"]["gross"]["amount"])
     assert Money(amount, "USD") == order.total.gross
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)
 
 
 ORDER_LINE_DELETE_MUTATION = """
@@ -91,7 +90,7 @@ ORDER_LINE_DELETE_MUTATION = """
 """
 
 
-@pytest.mark.parametrize("status", (OrderStatus.DRAFT, OrderStatus.UNCONFIRMED))
+@pytest.mark.parametrize("status", [OrderStatus.DRAFT, OrderStatus.UNCONFIRMED])
 @patch("saleor.plugins.manager.PluginsManager.draft_order_updated")
 @patch("saleor.plugins.manager.PluginsManager.order_updated")
 def test_order_line_remove_by_old_line_id(
@@ -99,10 +98,11 @@ def test_order_line_remove_by_old_line_id(
     draft_order_updated_webhook_mock,
     status,
     order_with_lines,
-    permission_manage_orders,
+    permission_group_manage_orders,
     staff_api_client,
 ):
     query = ORDER_LINE_DELETE_MUTATION
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
     order = order_with_lines
     order.status = status
     order.save(update_fields=["status"])
@@ -113,9 +113,7 @@ def test_order_line_remove_by_old_line_id(
     line_id = graphene.Node.to_global_id("OrderLine", line.old_id)
     variables = {"id": line_id}
 
-    response = staff_api_client.post_graphql(
-        query, variables, permissions=[permission_manage_orders]
-    )
+    response = staff_api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
     data = content["data"]["orderLineDelete"]
     assert OrderEvent.objects.count() == 1
@@ -150,7 +148,7 @@ ORDER_LINE_UPDATE_MUTATION = """
 """
 
 
-@pytest.mark.parametrize("status", (OrderStatus.DRAFT, OrderStatus.UNCONFIRMED))
+@pytest.mark.parametrize("status", [OrderStatus.DRAFT, OrderStatus.UNCONFIRMED])
 @patch("saleor.plugins.manager.PluginsManager.draft_order_updated")
 @patch("saleor.plugins.manager.PluginsManager.order_updated")
 def test_order_line_update_by_old_line_id(
@@ -158,7 +156,7 @@ def test_order_line_update_by_old_line_id(
     draft_order_updated_webhook_mock,
     status,
     order_with_lines,
-    permission_manage_orders,
+    permission_group_manage_orders,
     staff_api_client,
     staff_user,
 ):
@@ -175,7 +173,7 @@ def test_order_line_update_by_old_line_id(
     removed_quantity = 2
     line_id = graphene.Node.to_global_id("OrderLine", line.old_id)
     variables = {"lineId": line_id, "quantity": new_quantity}
-    staff_api_client.user.user_permissions.add(permission_manage_orders)
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
 
     # Ensure the line has the expected quantity
     assert line.quantity == 3
@@ -231,10 +229,11 @@ def test_order_fulfill_old_line_id(
     staff_api_client,
     staff_user,
     order_with_lines,
-    permission_manage_orders,
+    permission_group_manage_orders,
     warehouse,
     site_settings,
 ):
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
     site_settings.fulfillment_auto_approve = fulfillment_auto_approve
     site_settings.save(update_fields=["fulfillment_auto_approve"])
     order = order_with_lines
@@ -264,15 +263,13 @@ def test_order_fulfill_old_line_id(
             ],
         },
     }
-    response = staff_api_client.post_graphql(
-        query, variables, permissions=[permission_manage_orders]
-    )
+    response = staff_api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
     data = content["data"]["orderFulfill"]
     assert not data["errors"]
 
     fulfillment_lines_for_warehouses = {
-        str(warehouse.pk): [
+        warehouse.pk: [
             {"order_line": order_line, "quantity": 3},
             {"order_line": order_line2, "quantity": 2},
         ]
@@ -284,9 +281,9 @@ def test_order_fulfill_old_line_id(
         fulfillment_lines_for_warehouses,
         ANY,
         site_settings,
-        True,
+        notify_customer=True,
         allow_stock_to_be_exceeded=False,
-        approved=fulfillment_auto_approve,
+        auto_approved=fulfillment_auto_approve,
         tracking_number="",
     )
 
@@ -326,7 +323,7 @@ mutation OrderFulfillmentRefundProducts(
 def test_fulfillment_refund_products_order_lines_by_old_id(
     mocked_refund,
     staff_api_client,
-    permission_manage_orders,
+    permission_group_manage_orders,
     order_with_lines,
     payment_dummy,
 ):
@@ -345,7 +342,7 @@ def test_fulfillment_refund_products_order_lines_by_old_id(
         "order": order_id,
         "input": {"orderLines": [{"orderLineId": line_id, "quantity": 2}]},
     }
-    staff_api_client.user.user_permissions.add(permission_manage_orders)
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
 
     # when
     response = staff_api_client.post_graphql(ORDER_FULFILL_REFUND_MUTATION, variables)
@@ -435,7 +432,7 @@ mutation OrderFulfillmentReturnProducts(
 def test_fulfillment_return_products_order_lines_by_old_line_id(
     mocked_refund,
     staff_api_client,
-    permission_manage_orders,
+    permission_group_manage_orders,
     order_with_lines,
     payment_dummy,
 ):
@@ -477,7 +474,7 @@ def test_fulfillment_return_products_order_lines_by_old_line_id(
             ],
         },
     }
-    staff_api_client.user.user_permissions.add(permission_manage_orders)
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
     response = staff_api_client.post_graphql(ORDER_FULFILL_RETURN_MUTATION, variables)
 
     order_with_lines.refresh_from_db()
@@ -579,12 +576,12 @@ mutation OrderLineDiscountUpdate($input: OrderDiscountCommonInput!, $orderLineId
 """
 
 
-@pytest.mark.parametrize("status", (OrderStatus.DRAFT, OrderStatus.UNCONFIRMED))
+@pytest.mark.parametrize("status", [OrderStatus.DRAFT, OrderStatus.UNCONFIRMED])
 def test_update_order_line_discount_old_id(
     status,
     draft_order_with_fixed_discount_order,
     staff_api_client,
-    permission_manage_orders,
+    permission_group_manage_orders,
 ):
     order = draft_order_with_fixed_discount_order
     order.status = status
@@ -613,12 +610,31 @@ def test_update_order_line_discount_old_id(
             "reason": reason,
         },
     }
-    staff_api_client.user.user_permissions.add(permission_manage_orders)
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
     response = staff_api_client.post_graphql(ORDER_LINE_DISCOUNT_UPDATE, variables)
     content = get_graphql_content(response)
     data = content["data"]["orderLineDiscountUpdate"]
 
     line_to_discount.refresh_from_db()
+
+    second_line = order.lines.last()
+    order.refresh_from_db()
+    order_discount = order.discounts.get()
+    order_discount_amount = order_discount.amount
+    base_shipping = order.undiscounted_base_shipping_price
+    discount_applied_to_lines = order_discount_amount - (
+        base_shipping - order.shipping_price.gross
+    )
+    discount_applied_to_discounted_line = (
+        discount_applied_to_lines
+        - (second_line.base_unit_price - second_line.unit_price.gross)
+        * second_line.quantity
+    )
+    assert (
+        discount_applied_to_discounted_line
+        == (line_to_discount.base_unit_price - line_to_discount.unit_price.gross)
+        * line_to_discount.quantity
+    )
 
     errors = data["errors"]
     assert not errors
@@ -629,7 +645,10 @@ def test_update_order_line_discount_old_id(
     )
     expected_line_price = discount(line_price_before_discount)
 
-    assert line_to_discount.unit_price == quantize_price(expected_line_price, "USD")
+    assert (
+        line_to_discount.base_unit_price
+        == quantize_price(expected_line_price, "USD").gross
+    )
     unit_discount = line_to_discount.unit_discount
     assert unit_discount == (line_price_before_discount - expected_line_price).gross
 
@@ -671,7 +690,7 @@ def test_delete_discount_from_order_line_by_old_id(
     mocked_calculate_order_line_unit,
     draft_order_with_fixed_discount_order,
     staff_api_client,
-    permission_manage_orders,
+    permission_group_manage_orders,
 ):
     order = draft_order_with_fixed_discount_order
     order.status = OrderStatus.DRAFT
@@ -703,7 +722,7 @@ def test_delete_discount_from_order_line_by_old_id(
     variables = {
         "orderLineId": graphene.Node.to_global_id("OrderLine", line.old_id),
     }
-    staff_api_client.user.user_permissions.add(permission_manage_orders)
+    permission_group_manage_orders.user_set.add(staff_api_client.user)
     response = staff_api_client.post_graphql(ORDER_LINE_DISCOUNT_REMOVE, variables)
     content = get_graphql_content(response)
     data = content["data"]["orderLineDiscountRemove"]

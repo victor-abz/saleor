@@ -2,11 +2,11 @@
 
 import django.contrib.postgres.indexes
 from django.db import migrations, models
+
 import saleor.core.utils.json_serializer
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("checkout", "0048_alter_checkoutline_options"),
     ]
@@ -32,12 +32,14 @@ class Migration(migrations.Migration):
                 null=True,
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="checkoutline",
             index=django.contrib.postgres.indexes.GinIndex(
                 fields=["private_metadata"], name="checkoutline_p_meta_idx"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="checkoutline",
             index=django.contrib.postgres.indexes.GinIndex(
