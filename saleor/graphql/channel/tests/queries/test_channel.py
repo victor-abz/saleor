@@ -1,6 +1,7 @@
 import graphene
 from prices import Money
 
+from .....channel import TransactionFlowStrategy
 from .....shipping.models import ShippingMethodChannelListing, ShippingZone
 from ....tests.utils import (
     assert_no_permission,
@@ -19,6 +20,10 @@ QUERY_CHANNEL = """
             stockSettings{
                 allocationStrategy
             }
+            taxConfiguration {
+              id
+              pricesEnteredWithTax
+            }
         }
     }
 """
@@ -28,9 +33,11 @@ def test_query_channel_as_staff_user(staff_api_client, channel_USD):
     # given
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
     variables = {"id": channel_id}
-
+    tax_configuration_id = graphene.Node.to_global_id(
+        "TaxConfiguration", channel_USD.tax_configuration.id
+    )
     # when
-    response = staff_api_client.post_graphql(QUERY_CHANNEL, variables)
+    response = staff_api_client.post_graphql(QUERY_CHANNEL, variables=variables)
     content = get_graphql_content(response)
 
     # then
@@ -44,15 +51,20 @@ def test_query_channel_as_staff_user(staff_api_client, channel_USD):
         AllocationStrategyEnum[allocation_strategy].value
         == channel_USD.allocation_strategy
     )
+    assert channel_data["taxConfiguration"]["id"] == tax_configuration_id
+    assert channel_data["taxConfiguration"]["pricesEnteredWithTax"] is True
 
 
 def test_query_channel_as_app(app_api_client, channel_USD):
     # given
     channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
     variables = {"id": channel_id}
+    tax_configuration_id = graphene.Node.to_global_id(
+        "TaxConfiguration", channel_USD.tax_configuration.id
+    )
 
     # when
-    response = app_api_client.post_graphql(QUERY_CHANNEL, variables)
+    response = app_api_client.post_graphql(QUERY_CHANNEL, variables=variables)
     content = get_graphql_content(response)
 
     # then
@@ -66,6 +78,8 @@ def test_query_channel_as_app(app_api_client, channel_USD):
         AllocationStrategyEnum[allocation_strategy].value
         == channel_USD.allocation_strategy
     )
+    assert channel_data["taxConfiguration"]["id"] == tax_configuration_id
+    assert channel_data["taxConfiguration"]["pricesEnteredWithTax"] is True
 
 
 def test_query_channel_as_customer(user_api_client, channel_USD):
@@ -98,7 +112,7 @@ def test_query_channel_by_invalid_id(staff_api_client, channel_USD):
     response = staff_api_client.post_graphql(QUERY_CHANNEL, variables)
     content = get_graphql_content_from_response(response)
     assert len(content["errors"]) == 1
-    assert content["errors"][0]["message"] == f"Couldn't resolve id: {id}."
+    assert content["errors"][0]["message"] == f"Invalid ID: {id}. Expected: Channel."
     assert content["data"]["channel"] is None
 
 
@@ -191,12 +205,16 @@ def test_query_channel_returns_countries_attached_to_shipping_zone(
     # then
     content = get_graphql_content(response)
     channel_data = content["data"]["channel"]
-    assert set([country["code"] for country in channel_data["countries"]]) == set(
-        ["PL", "DE", "FR"]
-    )
-    assert set([country["country"] for country in channel_data["countries"]]) == set(
-        ["Poland", "Germany", "France"]
-    )
+    assert {country["code"] for country in channel_data["countries"]} == {
+        "PL",
+        "DE",
+        "FR",
+    }
+    assert {country["country"] for country in channel_data["countries"]} == {
+        "Poland",
+        "Germany",
+        "France",
+    }
 
 
 def test_query_channel_returns_supported_shipping_methods(
@@ -273,3 +291,449 @@ def test_query_channel_returns_supported_shipping_methods_with_countries_input(
     assert sm_per_country[0]["countryCode"] == "PL"
     assert len(sm_per_country[0]["shippingMethods"]) == 1
     assert sm_per_country[0]["shippingMethods"][0]["id"] == expected_shipping_method_id
+
+
+QUERY_CHANNEL_ORDER_SETTINGS = """
+    query getChannel($id: ID){
+        channel(id: $id){
+            id
+            name
+            slug
+            currencyCode
+            stockSettings{
+                allocationStrategy
+            }
+            orderSettings {
+                automaticallyConfirmAllNewOrders
+                automaticallyFulfillNonShippableGiftCard
+                expireOrdersAfter
+                markAsPaidStrategy
+                deleteExpiredOrdersAfter
+                allowUnpaidOrders
+                includeDraftOrderInVoucherUsage
+                draftOrderLinePriceFreezePeriod
+            }
+        }
+    }
+"""
+
+
+def test_query_channel_order_settings_as_staff_user(
+    permission_manage_channels, staff_api_client, channel_USD
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_ORDER_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_channels],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert channel_data["name"] == channel_USD.name
+    assert channel_data["slug"] == channel_USD.slug
+    assert channel_data["currencyCode"] == channel_USD.currency_code
+    allocation_strategy = channel_data["stockSettings"]["allocationStrategy"]
+    assert (
+        AllocationStrategyEnum[allocation_strategy].value
+        == channel_USD.allocation_strategy
+    )
+    assert (
+        channel_data["orderSettings"]["automaticallyConfirmAllNewOrders"]
+        == channel_USD.automatically_confirm_all_new_orders
+    )
+    assert (
+        channel_data["orderSettings"]["automaticallyFulfillNonShippableGiftCard"]
+        == channel_USD.automatically_fulfill_non_shippable_gift_card
+    )
+    assert (
+        channel_data["orderSettings"]["expireOrdersAfter"]
+        == channel_USD.expire_orders_after
+    )
+    assert (
+        channel_data["orderSettings"]["deleteExpiredOrdersAfter"]
+        == channel_USD.delete_expired_orders_after.days
+    )
+    assert (
+        channel_data["orderSettings"]["allowUnpaidOrders"]
+        == channel_USD.allow_unpaid_orders
+    )
+    assert (
+        channel_data["orderSettings"]["includeDraftOrderInVoucherUsage"]
+        == channel_USD.include_draft_order_in_voucher_usage
+    )
+    assert (
+        channel_data["orderSettings"]["draftOrderLinePriceFreezePeriod"]
+        == channel_USD.draft_order_line_price_freeze_period
+    )
+
+
+def test_query_channel_order_settings_as_app(
+    permission_manage_channels,
+    app_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        QUERY_CHANNEL_ORDER_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_channels],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert channel_data["name"] == channel_USD.name
+    assert channel_data["slug"] == channel_USD.slug
+    assert channel_data["currencyCode"] == channel_USD.currency_code
+    allocation_strategy = channel_data["stockSettings"]["allocationStrategy"]
+    assert (
+        AllocationStrategyEnum[allocation_strategy].value
+        == channel_USD.allocation_strategy
+    )
+    assert (
+        channel_data["orderSettings"]["automaticallyConfirmAllNewOrders"]
+        == channel_USD.automatically_confirm_all_new_orders
+    )
+    assert (
+        channel_data["orderSettings"]["automaticallyFulfillNonShippableGiftCard"]
+        == channel_USD.automatically_fulfill_non_shippable_gift_card
+    )
+    assert (
+        channel_data["orderSettings"]["expireOrdersAfter"]
+        == channel_USD.expire_orders_after
+    )
+    assert (
+        channel_data["orderSettings"]["includeDraftOrderInVoucherUsage"]
+        == channel_USD.include_draft_order_in_voucher_usage
+    )
+    assert (
+        channel_data["orderSettings"]["draftOrderLinePriceFreezePeriod"]
+        == channel_USD.draft_order_line_price_freeze_period
+    )
+
+
+def test_query_channel_order_settings_as_staff_user_no_permission(
+    staff_api_client, channel_USD
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_ORDER_SETTINGS,
+        variables=variables,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_query_channel_order_settings_as_app_no_permission(
+    app_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        QUERY_CHANNEL_ORDER_SETTINGS,
+        variables=variables,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+QUERY_CHANNEL_CHECKOUT_SETTINGS = """
+    query getChannel($id: ID){
+        channel(id: $id){
+            id
+            checkoutSettings {
+                useLegacyErrorFlow
+                automaticallyCompleteFullyPaidCheckouts
+            }
+        }
+    }
+"""
+
+
+def test_query_channel_checkout_settings_as_staff_user(
+    permission_manage_channels, staff_api_client, channel_USD
+):
+    # given
+    channel_USD.use_legacy_error_flow_for_checkout = False
+    channel_USD.automatically_complete_fully_paid_checkouts = True
+    channel_USD.save(
+        update_fields=[
+            "use_legacy_error_flow_for_checkout",
+            "automatically_complete_fully_paid_checkouts",
+        ]
+    )
+
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_channels],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert (
+        channel_data["checkoutSettings"]["useLegacyErrorFlow"]
+        == channel_USD.use_legacy_error_flow_for_checkout
+    )
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        == channel_USD.automatically_complete_fully_paid_checkouts
+    )
+
+
+def test_query_channel_checkout_settings_as_app(
+    permission_manage_channels,
+    app_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        QUERY_CHANNEL_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_channels],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert (
+        channel_data["checkoutSettings"]["useLegacyErrorFlow"]
+        == channel_USD.use_legacy_error_flow_for_checkout
+    )
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        == channel_USD.automatically_complete_fully_paid_checkouts
+    )
+
+
+def test_query_channel_checkout_settings_as_staff_user_no_permission(
+    staff_api_client, channel_USD
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_CHECKOUT_SETTINGS,
+        variables=variables,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_query_channel_checkout_settings_as_app_no_permission(
+    app_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        QUERY_CHANNEL_CHECKOUT_SETTINGS,
+        variables=variables,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_query_channel_checkout_settings_with_manage_checkouts(
+    permission_manage_checkouts, staff_api_client, channel_USD
+):
+    # given
+    channel_USD.use_legacy_error_flow_for_checkout = False
+    channel_USD.automatically_complete_fully_paid_checkouts = True
+    channel_USD.save(
+        update_fields=[
+            "use_legacy_error_flow_for_checkout",
+            "automatically_complete_fully_paid_checkouts",
+        ]
+    )
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_CHECKOUT_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_checkouts],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert (
+        channel_data["checkoutSettings"]["useLegacyErrorFlow"]
+        == channel_USD.use_legacy_error_flow_for_checkout
+    )
+    assert (
+        channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
+        == channel_USD.automatically_complete_fully_paid_checkouts
+    )
+
+
+QUERY_CHANNEL_PAYMENT_SETTINGS = """
+    query getChannel($id: ID){
+        channel(id: $id){
+            id
+            paymentSettings {
+                defaultTransactionFlowStrategy
+            }
+        }
+    }
+"""
+
+
+def test_query_channel_payment_settings_as_staff_user(
+    permission_manage_channels, staff_api_client, channel_USD
+):
+    # given
+    channel_USD.default_transaction_flow_strategy = (
+        TransactionFlowStrategy.AUTHORIZATION
+    )
+    channel_USD.save()
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_PAYMENT_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_channels],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert (
+        channel_data["paymentSettings"]["defaultTransactionFlowStrategy"]
+        == channel_USD.default_transaction_flow_strategy.upper()
+    )
+
+
+def test_query_channel_payment_settings_as_app(
+    permission_manage_channels,
+    app_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        QUERY_CHANNEL_PAYMENT_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_channels],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert (
+        channel_data["paymentSettings"]["defaultTransactionFlowStrategy"]
+        == channel_USD.default_transaction_flow_strategy.upper()
+    )
+
+
+def test_query_channel_payment_settings_as_staff_user_no_permission(
+    staff_api_client, channel_USD
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_PAYMENT_SETTINGS,
+        variables=variables,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_query_channel_payment_settings_as_app_no_permission(
+    app_api_client,
+    channel_USD,
+):
+    # given
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        QUERY_CHANNEL_PAYMENT_SETTINGS,
+        variables=variables,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_query_channel_payment_settings_with_handle_payments(
+    permission_manage_payments, staff_api_client, channel_USD
+):
+    # given
+    channel_USD.default_transaction_flow_strategy = (
+        TransactionFlowStrategy.AUTHORIZATION
+    )
+    channel_USD.save()
+    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {"id": channel_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_CHANNEL_PAYMENT_SETTINGS,
+        variables=variables,
+        permissions=[permission_manage_payments],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    channel_data = content["data"]["channel"]
+    assert channel_data["id"] == channel_id
+    assert (
+        channel_data["paymentSettings"]["defaultTransactionFlowStrategy"]
+        == channel_USD.default_transaction_flow_strategy.upper()
+    )

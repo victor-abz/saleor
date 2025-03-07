@@ -1,16 +1,15 @@
 from decimal import Decimal
 from operator import attrgetter
 from re import match
-from typing import Optional
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from django.conf import settings
-from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.indexes import BTreeIndex, GinIndex
 from django.contrib.postgres.search import SearchVectorField
 from django.core.validators import MinValueValidator
 from django.db import connection, models
-from django.db.models import JSONField  # type: ignore
-from django.db.models import F, Max
+from django.db.models import F, JSONField, Max
 from django.db.models.expressions import Exists, OuterRef
 from django.utils.timezone import now
 from django_measurement.models import MeasurementField
@@ -19,8 +18,7 @@ from measurement.measures import Weight
 
 from ..app.models import App
 from ..channel.models import Channel
-from ..core.models import ModelWithMetadata
-from ..core.permissions import OrderPermissions
+from ..core.models import ModelWithExternalReference, ModelWithMetadata
 from ..core.units import WeightUnits
 from ..core.utils.json_serializer import CustomJsonEncoder
 from ..core.weight import zero_weight
@@ -30,18 +28,23 @@ from ..giftcard.models import GiftCard
 from ..payment import ChargeStatus, TransactionKind
 from ..payment.model_helpers import get_subtotal
 from ..payment.models import Payment
+from ..permission.enums import OrderPermissions
 from ..shipping.models import ShippingMethod
 from . import (
     FulfillmentStatus,
     OrderAuthorizeStatus,
     OrderChargeStatus,
     OrderEvents,
+    OrderGrantedRefundStatus,
     OrderOrigin,
     OrderStatus,
 )
 
+if TYPE_CHECKING:
+    from ..account.models import User
 
-class OrderQueryset(models.QuerySet):
+
+class OrderQueryset(models.QuerySet["Order"]):
     def get_by_checkout_token(self, token):
         """Return non-draft order with matched checkout token."""
         return self.non_draft().filter(checkout_token=token).first()
@@ -83,11 +86,16 @@ class OrderQueryset(models.QuerySet):
             is_active=True, charge_status=ChargeStatus.NOT_CHARGED
         ).values("id")
         qs = self.filter(Exists(payments.filter(order_id=OuterRef("id"))))
-        return qs.exclude(status={OrderStatus.DRAFT, OrderStatus.CANCELED})
+        return qs.exclude(
+            status={OrderStatus.DRAFT, OrderStatus.CANCELED, OrderStatus.EXPIRED}
+        )
 
     def ready_to_confirm(self):
         """Return unconfirmed orders."""
         return self.filter(status=OrderStatus.UNCONFIRMED)
+
+
+OrderManager = models.Manager.from_queryset(OrderQueryset)
 
 
 def get_order_number():
@@ -97,13 +105,14 @@ def get_order_number():
         return result[0]
 
 
-class Order(ModelWithMetadata):
+class Order(ModelWithMetadata, ModelWithExternalReference):
     id = models.UUIDField(primary_key=True, editable=False, unique=True, default=uuid4)
     number = models.IntegerField(unique=True, default=get_order_number, editable=False)
     use_old_id = models.BooleanField(default=False)
-
     created_at = models.DateTimeField(default=now, editable=False)
     updated_at = models.DateTimeField(auto_now=True, editable=False, db_index=True)
+    expired_at = models.DateTimeField(blank=True, null=True)
+
     status = models.CharField(
         max_length=32, default=OrderStatus.UNFULFILLED, choices=OrderStatus.CHOICES
     )
@@ -120,7 +129,7 @@ class Order(ModelWithMetadata):
         db_index=True,
     )
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+        "account.User",
         blank=True,
         null=True,
         related_name="orders",
@@ -144,6 +153,10 @@ class Order(ModelWithMetadata):
         null=True,
         on_delete=models.SET_NULL,
     )
+    # The flag is only applicable to draft orders and should be null for orders
+    # with a status other than `DRAFT`.
+    draft_save_billing_address = models.BooleanField(null=True, blank=True)
+    draft_save_shipping_address = models.BooleanField(null=True, blank=True)
     user_email = models.EmailField(blank=True, default="")
     original = models.ForeignKey(
         "self", null=True, blank=True, on_delete=models.SET_NULL
@@ -200,6 +213,7 @@ class Order(ModelWithMetadata):
         amount_field="shipping_price_gross_amount", currency_field="currency"
     )
 
+    # Price with applied shipping voucher discount
     shipping_price = TaxedMoneyField(
         net_amount_field="shipping_price_net_amount",
         gross_amount_field="shipping_price_gross_amount",
@@ -210,8 +224,19 @@ class Order(ModelWithMetadata):
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
         default=Decimal("0.0"),
     )
+    # Shipping price with applied shipping voucher discount, without tax
     base_shipping_price = MoneyField(
         amount_field="base_shipping_price_amount", currency_field="currency"
+    )
+    undiscounted_base_shipping_price_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0.0"),
+    )
+    # Shipping price before applying any discounts
+    undiscounted_base_shipping_price = MoneyField(
+        amount_field="undiscounted_base_shipping_price_amount",
+        currency_field="currency",
     )
     shipping_tax_rate = models.DecimalField(
         max_digits=5, decimal_places=4, blank=True, null=True
@@ -294,16 +319,34 @@ class Order(ModelWithMetadata):
     total_charged = MoneyField(
         amount_field="total_charged_amount", currency_field="currency"
     )
+    subtotal_net_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal(0),
+    )
+    subtotal_gross_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal(0),
+    )
+    subtotal = TaxedMoneyField(
+        net_amount_field="subtotal_net_amount",
+        gross_amount_field="subtotal_gross_amount",
+    )
 
     voucher = models.ForeignKey(
         Voucher, blank=True, null=True, related_name="+", on_delete=models.SET_NULL
+    )
+
+    voucher_code = models.CharField(
+        max_length=255, null=True, blank=True, db_index=False
     )
     gift_cards = models.ManyToManyField(GiftCard, blank=True, related_name="orders")
     display_gross_prices = models.BooleanField(default=True)
     customer_note = models.TextField(blank=True, default="")
     weight = MeasurementField(
         measurement=Weight,
-        unit_choices=WeightUnits.CHOICES,  # type: ignore
+        unit_choices=WeightUnits.CHOICES,
         default=zero_weight,
     )
     redirect_url = models.URLField(blank=True, null=True)
@@ -312,12 +355,16 @@ class Order(ModelWithMetadata):
     # this field is used only for draft/unconfirmed orders
     should_refresh_prices = models.BooleanField(default=True)
     tax_exemption = models.BooleanField(default=False)
+    tax_error = models.CharField(max_length=255, null=True, blank=True)
 
-    objects = models.Manager.from_queryset(OrderQueryset)()
+    objects = OrderManager()
 
     class Meta:
         ordering = ("-number",)
-        permissions = ((OrderPermissions.MANAGE_ORDERS.codename, "Manage orders."),)
+        permissions = (
+            (OrderPermissions.MANAGE_ORDERS.codename, "Manage orders."),
+            (OrderPermissions.MANAGE_ORDERS_IMPORT.codename, "Manage orders import."),
+        )
         indexes = [
             *ModelWithMetadata.Meta.indexes,
             GinIndex(
@@ -336,6 +383,13 @@ class Order(ModelWithMetadata):
                 fields=["user_email"],
                 opclasses=["gin_trgm_ops"],
             ),
+            models.Index(fields=["created_at"], name="idx_order_created_at"),
+            GinIndex(fields=["voucher_code"], name="order_voucher_code_idx"),
+            GinIndex(
+                fields=["user_email", "user_id"],
+                name="order_user_email_user_id_idx",
+            ),
+            BTreeIndex(fields=["checkout_token"], name="checkout_token_btree_idx"),
         ]
 
     def is_fully_paid(self):
@@ -345,25 +399,24 @@ class Order(ModelWithMetadata):
         return self.total_charged_amount > 0
 
     def get_customer_email(self):
-        return self.user.email if self.user_id else self.user_email
-
-    def _index_billing_phone(self):
-        return self.billing_address.phone
-
-    def _index_shipping_phone(self):
-        return self.shipping_address.phone
+        if self.user_id:
+            # we know that when user_id is set, user is set as well
+            return cast("User", self.user).email
+        return self.user_email
 
     def __repr__(self):
-        return "<Order #%r>" % (self.id,)
+        return f"<Order #{self.id!r}>"
 
     def __str__(self):
-        return "#%d" % (self.id,)
+        return f"#{self.id}"
 
-    def get_last_payment(self):
+    def get_last_payment(self) -> Payment | None:
         # Skipping a partial payment is a temporary workaround for storing a basic data
         # about partial payment from Adyen plugin. This is something that will removed
         # in 3.1 by introducing a partial payments feature.
-        payments = [payment for payment in self.payments.all() if not payment.partial]
+        payments: list[Payment] = [
+            payment for payment in self.payments.all() if not payment.partial
+        ]
         return max(payments, default=None, key=attrgetter("pk"))
 
     def is_pre_authorized(self):
@@ -388,11 +441,16 @@ class Order(ModelWithMetadata):
             .exists()
         )
 
-    def is_shipping_required(self):
-        return any(line.is_shipping_required for line in self.lines.all())
-
     def get_subtotal(self):
         return get_subtotal(self.lines.all(), self.currency)
+
+    def is_shipping_required(
+        self, database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME
+    ):
+        return any(
+            line.is_shipping_required
+            for line in self.lines.using(database_connection_name).all()
+        )
 
     def get_total_quantity(self):
         return sum([line.quantity for line in self.lines.all()])
@@ -402,6 +460,9 @@ class Order(ModelWithMetadata):
 
     def is_unconfirmed(self):
         return self.status == OrderStatus.UNCONFIRMED
+
+    def is_expired(self):
+        return self.status == OrderStatus.EXPIRED
 
     def is_open(self):
         statuses = {OrderStatus.UNFULFILLED, OrderStatus.PARTIALLY_FULFILLED}
@@ -419,14 +480,22 @@ class Order(ModelWithMetadata):
             not self.fulfillments.exclude(
                 status__in=statuses_allowed_to_cancel
             ).exists()
-        ) and self.status not in {OrderStatus.CANCELED, OrderStatus.DRAFT}
+        ) and self.status not in {
+            OrderStatus.CANCELED,
+            OrderStatus.DRAFT,
+            OrderStatus.EXPIRED,
+        }
 
     def can_capture(self, payment=None):
         if not payment:
             payment = self.get_last_payment()
         if not payment:
             return False
-        order_status_ok = self.status not in {OrderStatus.DRAFT, OrderStatus.CANCELED}
+        order_status_ok = self.status not in {
+            OrderStatus.DRAFT,
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+        }
         return payment.can_capture() and order_status_ok
 
     def can_void(self, payment=None):
@@ -452,11 +521,8 @@ class Order(ModelWithMetadata):
     def total_balance(self):
         return self.total_charged - self.total.gross
 
-    def get_total_weight(self, _lines=None):
-        return self.weight
 
-
-class OrderLineQueryset(models.QuerySet):
+class OrderLineQueryset(models.QuerySet["OrderLine"]):
     def digital(self):
         """Return lines with digital products."""
         for line in self.all():
@@ -468,6 +534,9 @@ class OrderLineQueryset(models.QuerySet):
         for line in self.all():
             if not line.is_digital:
                 yield line
+
+
+OrderLineManager = models.Manager.from_queryset(OrderLineQueryset)
 
 
 class OrderLine(ModelWithMetadata):
@@ -501,6 +570,7 @@ class OrderLine(ModelWithMetadata):
     quantity_fulfilled = models.IntegerField(
         validators=[MinValueValidator(0)], default=0
     )
+    is_gift = models.BooleanField(default=False)
 
     currency = models.CharField(
         max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH,
@@ -517,7 +587,8 @@ class OrderLine(ModelWithMetadata):
     unit_discount_type = models.CharField(
         max_length=10,
         choices=DiscountValueType.CHOICES,
-        default=DiscountValueType.FIXED,
+        null=True,
+        blank=True,
     )
     unit_discount_reason = models.TextField(blank=True, null=True)
 
@@ -529,7 +600,7 @@ class OrderLine(ModelWithMetadata):
     unit_discount_value = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
-        default=0,
+        default=Decimal("0.0"),
     )
     unit_price_net = MoneyField(
         amount_field="unit_price_net_amount", currency_field="currency"
@@ -640,13 +711,19 @@ class OrderLine(ModelWithMetadata):
         blank=True, null=True, default=dict, encoder=CustomJsonEncoder
     )
 
+    is_price_overridden = models.BooleanField(null=True, blank=True)
+
     # Fulfilled when voucher code was used for product in the line
     voucher_code = models.CharField(max_length=255, null=True, blank=True)
 
     # Fulfilled when sale was applied to product in the line
     sale_id = models.CharField(max_length=255, null=True, blank=True)
 
-    objects = models.Manager.from_queryset(OrderLineQueryset)()
+    # The date time when the line should refresh its prices.
+    # It depends on channel.draft_order_line_price_freeze_period setting.
+    draft_base_price_expire_at = models.DateTimeField(blank=True, null=True)
+
+    objects = OrderLineManager()
 
     class Meta(ModelWithMetadata.Meta):
         ordering = ("created_at", "id")
@@ -663,10 +740,10 @@ class OrderLine(ModelWithMetadata):
         return self.quantity - self.quantity_fulfilled
 
     @property
-    def is_digital(self) -> Optional[bool]:
+    def is_digital(self) -> bool:
         """Check if a variant is digital and contains digital content."""
         if not self.variant:
-            return None
+            return False
         is_digital = self.variant.is_digital()
         has_digital = hasattr(self.variant, "digital_content")
         return is_digital and has_digital
@@ -779,9 +856,85 @@ class OrderEvent(models.Model):
         related_name="+",
     )
     app = models.ForeignKey(App, related_name="+", on_delete=models.SET_NULL, null=True)
+    related = models.ForeignKey(
+        "self",
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="related_events",
+        db_index=False,
+    )
 
     class Meta:
         ordering = ("date",)
+        indexes = [
+            BTreeIndex(fields=["related"], name="order_orderevent_related_id_idx"),
+            models.Index(fields=["type"]),
+        ]
 
     def __repr__(self):
         return f"{self.__class__.__name__}(type={self.type!r}, user={self.user!r})"
+
+
+class OrderGrantedRefund(models.Model):
+    """Model used to store granted refund for the order."""
+
+    created_at = models.DateTimeField(default=now, editable=False)
+    updated_at = models.DateTimeField(auto_now=True, editable=False, db_index=True)
+
+    amount_value = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal("0"),
+    )
+    amount = MoneyField(amount_field="amount_value", currency_field="currency")
+    currency = models.CharField(
+        max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH,
+    )
+    reason = models.TextField(blank=True, default="")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    app = models.ForeignKey(
+        App, related_name="+", on_delete=models.SET_NULL, null=True, blank=True
+    )
+    order = models.ForeignKey(
+        Order, related_name="granted_refunds", on_delete=models.CASCADE
+    )
+    shipping_costs_included = models.BooleanField(default=False)
+
+    transaction_item = models.ForeignKey(
+        "payment.TransactionItem",
+        related_name="granted_refund",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    status = models.CharField(
+        choices=OrderGrantedRefundStatus.CHOICES,
+        default=OrderGrantedRefundStatus.NONE,
+        max_length=128,
+    )
+
+    class Meta:
+        ordering = ("created_at", "id")
+
+
+class OrderGrantedRefundLine(models.Model):
+    """Model used to store granted refund line for the order."""
+
+    order_line = models.ForeignKey(
+        OrderLine, related_name="granted_refund_lines", on_delete=models.CASCADE
+    )
+    quantity = models.PositiveIntegerField()
+
+    granted_refund = models.ForeignKey(
+        OrderGrantedRefund, related_name="lines", on_delete=models.CASCADE
+    )
+
+    reason = models.TextField(blank=True, null=True, default="")

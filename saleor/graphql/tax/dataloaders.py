@@ -34,7 +34,7 @@ class TaxConfigurationPerCountryByTaxConfigurationIDLoader(DataLoader):
         return [one_to_many[key] for key in keys]
 
 
-class TaxConfigurationByChannelId(DataLoader):
+class TaxConfigurationByChannelId(DataLoader[int, TaxConfiguration]):
     context_key = "tax_configuration_by_channel_id"
 
     def batch_load(self, keys):
@@ -44,7 +44,7 @@ class TaxConfigurationByChannelId(DataLoader):
         return [tax_configs[key] for key in keys]
 
 
-class TaxClassCountryRateByTaxClassIDLoader(DataLoader):
+class TaxClassCountryRateByTaxClassIDLoader(DataLoader[int, list[TaxClassCountryRate]]):
     context_key = "tax_class_country_rate_by_tax_class_id"
 
     def batch_load(self, keys):
@@ -89,8 +89,8 @@ class TaxClassByProductIdLoader(DataLoader):
 
         def load_tax_classes(results):
             (products, product_types) = results
-            products_map = dict(zip(keys, products))
-            product_types_map = dict(zip(keys, product_types))
+            products_map = dict(zip(keys, products, strict=False))
+            product_types_map = dict(zip(keys, product_types, strict=False))
 
             tax_class_ids_map = {}
             for product_id in keys:
@@ -118,8 +118,8 @@ class TaxClassByVariantIdLoader(DataLoader):
 
         def load_tax_classes(results):
             (products, product_types) = results
-            products_map = dict(zip(keys, products))
-            product_types_map = dict(zip(keys, product_types))
+            products_map = dict(zip(keys, products, strict=False))
+            product_types_map = dict(zip(keys, product_types, strict=False))
 
             tax_class_ids_map = {}
             for variant_pk in keys:

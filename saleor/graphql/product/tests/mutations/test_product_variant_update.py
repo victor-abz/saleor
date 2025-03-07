@@ -1,19 +1,18 @@
+import datetime
 import json
-from datetime import datetime, timedelta
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, call, patch
 from uuid import uuid4
 
 import graphene
 import pytest
-import pytz
 from django.conf import settings
 from django.utils.text import slugify
 
 from .....attribute import AttributeInputType
 from .....attribute.models import AttributeValue
 from .....attribute.utils import associate_attribute_values_to_instance
+from .....discount.utils.promotion import mark_active_catalogue_promotion_rules_as_dirty
 from .....product.error_codes import ProductErrorCode
-from .....tests.utils import flush_post_commit_hooks
 from ....tests.utils import get_graphql_content
 
 
@@ -103,10 +102,11 @@ def test_update_product_variant_by_id(
 ):
     query = """
         mutation updateVariant (
-            $id: ID!,
-            $sku: String!,
+            $id: ID!
+            $sku: String!
             $quantityLimitPerCustomer: Int!
-            $trackInventory: Boolean!,
+            $trackInventory: Boolean!
+            $externalReference: String
             $attributes: [AttributeValueInput!]) {
                 productVariantUpdate(
                     id: $id,
@@ -114,12 +114,14 @@ def test_update_product_variant_by_id(
                         sku: $sku,
                         trackInventory: $trackInventory,
                         attributes: $attributes,
+                        externalReference: $externalReference
                         quantityLimitPerCustomer: $quantityLimitPerCustomer,
                     }) {
                     productVariant {
                         name
                         sku
                         quantityLimitPerCustomer
+                        externalReference
                         channelListings {
                             channel {
                                 slug
@@ -135,6 +137,7 @@ def test_update_product_variant_by_id(
     sku = "test sku"
     quantity_limit_per_customer = 5
     attr_value = "S"
+    external_reference = "test-ext-ref"
 
     variables = {
         "id": variant_id,
@@ -142,6 +145,7 @@ def test_update_product_variant_by_id(
         "trackInventory": True,
         "quantityLimitPerCustomer": quantity_limit_per_customer,
         "attributes": [{"id": attribute_id, "values": [attr_value]}],
+        "externalReference": external_reference,
     }
 
     response = staff_api_client.post_graphql(
@@ -149,16 +153,277 @@ def test_update_product_variant_by_id(
     )
     variant.refresh_from_db()
     content = get_graphql_content(response)
-    flush_post_commit_hooks()
     data = content["data"]["productVariantUpdate"]["productVariant"]
 
     assert data["name"] == variant.name
     assert data["sku"] == sku
+    assert data["externalReference"] == external_reference == variant.external_reference
     assert data["quantityLimitPerCustomer"] == quantity_limit_per_customer
     product_variant_updated_webhook_mock.assert_called_once_with(
         product.variants.last()
     )
     product_variant_created_webhook_mock.assert_not_called()
+
+
+QUERY_UPDATE_VARIANT_CHANGING_FIELDS = """
+        mutation updateVariant (
+            $id: ID!
+            $sku: String!
+            $quantityLimitPerCustomer: Int!
+            $trackInventory: Boolean!
+            $externalReference: String
+            $metadata: [MetadataInput!]
+            $privateMetadata: [MetadataInput!]
+            $preorder: PreorderSettingsInput
+            $attributes: [AttributeValueInput!]) {
+                productVariantUpdate(
+                    id: $id,
+                    input: {
+                        sku: $sku,
+                        trackInventory: $trackInventory,
+                        attributes: $attributes,
+                        externalReference: $externalReference
+                        quantityLimitPerCustomer: $quantityLimitPerCustomer,
+                        metadata: $metadata,
+                        preorder: $preorder,
+                        privateMetadata: $privateMetadata,
+                    }) {
+                    productVariant {
+                        name
+                        sku
+                        quantityLimitPerCustomer
+                        externalReference
+                        channelListings {
+                            channel {
+                                slug
+                            }
+                        }
+                        metadata {
+                            key
+                            value
+                        }
+                        privateMetadata {
+                            key
+                            value
+                        }
+                    }
+                    errors {
+                      field
+                      message
+                      attributes
+                      code}
+                }
+            }
+    """
+
+
+@pytest.mark.parametrize(
+    ("fields", "changed_fields"),
+    [
+        ({"sku": 1234}, ["sku"]),
+        ({"metadata": [{"key": "test_key1", "value": "test_value2"}]}, ["metadata"]),
+        ({"trackInventory": False}, ["track_inventory"]),
+        ({"quantityLimitPerCustomer": 5}, ["quantity_limit_per_customer"]),
+        (
+            {"preorder": {"globalThreshold": 11, "endDate": "2024-12-03T00:00Z"}},
+            ["preorder_end_date", "preorder_global_threshold"],
+        ),
+        (
+            {"preorder": {"globalThreshold": 10, "endDate": "2024-12-03T00:00Z"}},
+            ["preorder_end_date"],
+        ),
+        (
+            {"preorder": {"globalThreshold": 11, "endDate": "2024-12-02T00:00Z"}},
+            ["preorder_global_threshold"],
+        ),
+        ({"externalReference": "test-ext-ref2"}, ["external_reference"]),
+        (
+            {"sku": 1234, "trackInventory": False, "externalReference": "test-ext-ref"},
+            ["sku", "track_inventory"],
+        ),
+    ],
+)
+@patch(
+    "saleor.graphql.product.mutations.product_variant.ProductVariantUpdate.call_event"
+)
+@patch(
+    "saleor.graphql.product.mutations.product_variant.ProductVariantUpdate._save_variant_instance"
+)
+def test_update_product_variant_update_fields_when_necessary(
+    save_variant_mock,
+    call_event_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+    fields,
+    changed_fields,
+):
+    # given
+    variant = product.variants.first()
+    quantity_limit = 9
+    external_reference = "test-ext-ref"
+    variant_name = variant.attributes.first().values.first().name
+    variant_sku = "123"
+    product.default_variant = variant
+    product.save(update_fields=["default_variant"])
+    variant.name = variant_name
+    variant.metadata = {"test_key1": "test_value1"}
+    variant.private_metadata = {"private_key1": "private_value_1"}
+    variant.external_reference = external_reference
+    variant.quantity_limit_per_customer = quantity_limit
+    variant.track_inventory = True
+    variant.is_preorder = True
+    variant.preorder_global_threshold = 10
+    variant.preorder_end_date = "2024-12-02T00:00Z"
+    variant.save()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    variables = {
+        "id": variant_id,
+        "sku": variant_sku,
+        "trackInventory": True,
+        "quantityLimitPerCustomer": quantity_limit,
+        "externalReference": external_reference,
+        "metadata": [{"key": "test_key1", "value": "test_value1"}],
+        "privateMetadata": [{"key": "private_key1", "value": "private_value_1"}],
+    }
+
+    for field, value in fields.items():
+        variables[field] = value
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_UPDATE_VARIANT_CHANGING_FIELDS,
+        variables,
+        permissions=[permission_manage_products],
+    )
+
+    # then
+    variant.refresh_from_db()
+    get_graphql_content(response)
+    save_variant_mock.assert_called_once_with(variant, changed_fields)
+    call_event_mock.assert_has_calls(
+        [
+            call(ANY, variant),
+            call(mark_active_catalogue_promotion_rules_as_dirty, ANY),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "field_values",
+    [
+        ["sku", 123],
+        ["metadata", [{"key": "test_key1", "value": "test_value1"}]],
+        ["trackInventory", True],
+        ["quantityLimitPerCustomer", 9],
+        ["preorder", {"globalThreshold": 10, "endDate": "2024-12-02T00:00Z"}],
+        ["externalReference", "test-ext-ref"],
+    ],
+)
+@patch(
+    "saleor.graphql.product.mutations.product_variant.ProductVariantUpdate.call_event"
+)
+@patch(
+    "saleor.graphql.product.mutations.product_variant.ProductVariantUpdate._save_variant_instance"
+)
+def test_update_product_variant_skip_updating_fields_when_unchanged(
+    save_variant_mock,
+    call_event_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+    field_values,
+):
+    # given
+    variant = product.variants.first()
+    quantity_limit = 9
+    external_reference = "test-ext-ref"
+    variant_name = variant.attributes.first().values.first().name
+    variant_sku = "123"
+    product.default_variant = variant
+    product.save(update_fields=["default_variant"])
+    variant.name = variant_name
+    variant.is_preorder = True
+    variant.preorder_global_threshold = 10
+    variant.preorder_end_date = "2024-12-02T00:00Z"
+    variant.metadata = {"test_key1": "test_value1"}
+    variant.private_metadata = {"private_key1": "private_value_1"}
+    variant.external_reference = external_reference
+    variant.quantity_limit_per_customer = quantity_limit
+    variant.track_inventory = True
+    variant.save()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    variables = {
+        "id": variant_id,
+        "sku": variant_sku,
+        "trackInventory": True,
+        "quantityLimitPerCustomer": quantity_limit,
+        "externalReference": external_reference,
+        "metadata": [{"key": "test_key1", "value": "test_value1"}],
+        "privateMetadata": [{"key": "private_key1", "value": "private_value_1"}],
+    }
+
+    field, value = field_values
+    variables[field] = value
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_UPDATE_VARIANT_CHANGING_FIELDS,
+        variables,
+        permissions=[permission_manage_products],
+    )
+
+    # then
+    variant.refresh_from_db()
+    get_graphql_content(response)
+    save_variant_mock.assert_not_called()
+    call_event_mock.assert_not_called()
+
+
+def test_update_product_variant_marks_prices_as_dirty(
+    staff_api_client,
+    product,
+    size_attribute,
+    permission_manage_products,
+    catalogue_promotion,
+):
+    # given
+    query = """
+        mutation updateVariant (
+            $id: ID!
+            $sku: String!) {
+                productVariantUpdate(
+                    id: $id,
+                    input: {
+                        sku: $sku,
+                    }) {
+                    productVariant {
+                        name
+                        sku
+                    }
+                }
+            }
+    """
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    sku = "test sku"
+
+    variables = {
+        "id": variant_id,
+        "sku": sku,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    # then
+    variant.refresh_from_db()
+    get_graphql_content(response)
+    assert not catalogue_promotion.rules.filter(variants_dirty=False).exists()
 
 
 UPDATE_VARIANT_BY_SKU = """
@@ -227,9 +492,9 @@ def test_update_product_variant_by_sku(
     response = staff_api_client.post_graphql(
         UPDATE_VARIANT_BY_SKU, variables, permissions=[permission_manage_products]
     )
+
     variant.refresh_from_db()
     content = get_graphql_content(response)
-    flush_post_commit_hooks()
     data = content["data"]["productVariantUpdate"]["productVariant"]
 
     # then
@@ -269,12 +534,160 @@ def test_update_product_variant_by_sku_return_error_when_sku_dont_exists(
     )
     variant.refresh_from_db()
     content = get_graphql_content(response)
-    flush_post_commit_hooks()
     data = content["data"]["productVariantUpdate"]
 
     # then
     assert data["errors"][0]["field"] == "sku"
     assert data["errors"][0]["code"] == "NOT_FOUND"
+
+
+UPDATE_VARIANT_BY_EXTERNAL_REFERENCE = """
+     mutation updateVariant (
+        $id: ID, $externalReference: String, $input: ProductVariantInput!
+    ) {
+        productVariantUpdate(
+            id: $id,
+            externalReference: $externalReference,
+            input: $input
+        ) {
+            productVariant {
+                id
+                sku
+                externalReference
+            }
+            errors {
+              message
+              field
+              code
+            }
+        }
+    }
+    """
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_created")
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+def test_update_product_variant_by_external_reference(
+    product_variant_updated_webhook_mock,
+    product_variant_created_webhook_mock,
+    staff_api_client,
+    product,
+    size_attribute,
+    permission_manage_products,
+):
+    #   given
+    query = UPDATE_VARIANT_BY_EXTERNAL_REFERENCE
+
+    ext_ref = "test-ext-ref"
+    new_sku = "new-test-sku"
+    variant = product.variants.first()
+    variant.external_reference = ext_ref
+    variant.save(update_fields=["external_reference"])
+
+    variables = {
+        "externalReference": ext_ref,
+        "input": {"sku": new_sku},
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]
+
+    # then
+    assert not data["errors"]
+    assert data["productVariant"]["sku"] == new_sku
+    assert data["productVariant"]["externalReference"] == ext_ref
+    assert data["productVariant"]["id"] == graphene.Node.to_global_id(
+        variant._meta.model.__name__, variant.id
+    )
+    product_variant_updated_webhook_mock.assert_called_once_with(
+        product.variants.last()
+    )
+    product_variant_created_webhook_mock.assert_not_called()
+
+
+def test_update_product_variant_by_both_id_and_external_reference(
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    #   given
+    query = UPDATE_VARIANT_BY_EXTERNAL_REFERENCE
+    variables = {"externalReference": "whatever", "id": "whatever", "input": {}}
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    errors = content["data"]["productVariantUpdate"]["errors"]
+    assert (
+        errors[0]["message"]
+        == "Argument 'id' cannot be combined with 'external_reference'"
+    )
+
+
+def test_update_product_variant_by_external_reference_not_existing(
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    #   given
+    query = UPDATE_VARIANT_BY_EXTERNAL_REFERENCE
+    ext_ref = "non-existing-ext-ref"
+    variables = {"externalReference": ext_ref, "input": {}}
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    errors = content["data"]["productVariantUpdate"]["errors"]
+    assert errors[0]["message"] == f"Couldn't resolve to a node: {ext_ref}"
+
+
+def test_update_product_variant_with_non_unique_external_reference(
+    staff_api_client,
+    product_list,
+    permission_manage_products,
+):
+    #   given
+    query = UPDATE_VARIANT_BY_EXTERNAL_REFERENCE
+    ext_ref = "test-ext-ref"
+
+    product_1 = product_list[0]
+    variant_1 = product_1.variants.first()
+    variant_1.external_reference = ext_ref
+    variant_1.save(update_fields=["external_reference"])
+
+    product_2 = product_list[1]
+    variant_2 = product_2.variants.first()
+    variant_2_id = graphene.Node.to_global_id("ProductVariant", variant_2.pk)
+
+    variables = {"id": variant_2_id, "input": {"externalReference": ext_ref}}
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    error = content["data"]["productVariantUpdate"]["errors"][0]
+    assert error["field"] == "externalReference"
+    assert error["code"] == ProductErrorCode.UNIQUE.name
+    assert (
+        error["message"]
+        == "Product variant with this External reference already exists."
+    )
 
 
 def test_update_product_variant_with_negative_weight(
@@ -722,7 +1135,8 @@ def test_update_variant_with_boolean_attribute(
     }
 
     associate_attribute_values_to_instance(
-        variant, boolean_attribute, boolean_attribute.values.first()
+        variant,
+        {boolean_attribute.id: [boolean_attribute.values.first()]},
     )
 
     response = staff_api_client.post_graphql(
@@ -739,6 +1153,193 @@ def test_update_variant_with_boolean_attribute(
     assert data["attributes"][-1]["values"][0]["boolean"] is new_value
     assert boolean_attribute.values.count() == values_count
     product_variant_updated.assert_called_once_with(product.variants.last())
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+def test_update_variant_with_swatch_attribute_new_value_created(
+    product_variant_updated,
+    permission_manage_products,
+    product,
+    product_type,
+    staff_api_client,
+    warehouse,
+    swatch_attribute,
+):
+    # given
+    product_type.variant_attributes.add(swatch_attribute)
+    query = QUERY_UPDATE_VARIANT_ATTRIBUTES
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    sku = "123"
+    swatch_attr_id = graphene.Node.to_global_id("Attribute", swatch_attribute.pk)
+
+    value = "NEW"
+    values_count = swatch_attribute.values.count()
+    variables = {
+        "id": variant_id,
+        "sku": sku,
+        "attributes": [
+            {
+                "id": swatch_attr_id,
+                "swatch": {"value": value},
+            }
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)["data"]["productVariantUpdate"]
+    variant.refresh_from_db()
+    data = content["productVariant"]
+
+    assert not content["errors"]
+    assert data["sku"] == sku
+    assert data["attributes"][-1]["attribute"]["slug"] == swatch_attribute.slug
+    assert data["attributes"][-1]["values"][0]["name"] == value
+    assert swatch_attribute.values.count() == values_count + 1
+    product_variant_updated.assert_called_once_with(product.variants.last())
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+def test_update_variant_with_swatch_attribute_existing_value(
+    product_variant_updated,
+    permission_manage_products,
+    product,
+    product_type,
+    staff_api_client,
+    warehouse,
+    swatch_attribute,
+):
+    # given
+    product_type.variant_attributes.add(swatch_attribute)
+    query = QUERY_UPDATE_VARIANT_ATTRIBUTES
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    sku = "123"
+    swatch_attr_id = graphene.Node.to_global_id("Attribute", swatch_attribute.pk)
+
+    value = swatch_attribute.values.first()
+    value_id = graphene.Node.to_global_id("AttributeValue", value.id)
+    values_count = swatch_attribute.values.count()
+    variables = {
+        "id": variant_id,
+        "sku": sku,
+        "attributes": [
+            {
+                "id": swatch_attr_id,
+                "swatch": {"id": value_id},
+            }
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)["data"]["productVariantUpdate"]
+    variant.refresh_from_db()
+    data = content["productVariant"]
+
+    assert not content["errors"]
+    assert data["sku"] == sku
+    assert data["attributes"][-1]["attribute"]["slug"] == swatch_attribute.slug
+    assert data["attributes"][-1]["values"][0]["name"] == value.name
+    assert swatch_attribute.values.count() == values_count
+    product_variant_updated.assert_called_once_with(product.variants.last())
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+def test_update_variant_with_swatch_attribute_use_values(
+    product_variant_updated,
+    permission_manage_products,
+    product,
+    product_type,
+    staff_api_client,
+    warehouse,
+    swatch_attribute,
+):
+    # given
+    product_type.variant_attributes.add(swatch_attribute)
+    query = QUERY_UPDATE_VARIANT_ATTRIBUTES
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    sku = "123"
+    swatch_attr_id = graphene.Node.to_global_id("Attribute", swatch_attribute.pk)
+
+    value = "NEW"
+    values_count = swatch_attribute.values.count()
+    variables = {
+        "id": variant_id,
+        "sku": sku,
+        "attributes": [
+            {"id": swatch_attr_id, "values": [value]},
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)["data"]["productVariantUpdate"]
+    variant.refresh_from_db()
+    data = content["productVariant"]
+
+    assert not content["errors"]
+    assert data["sku"] == sku
+    assert data["attributes"][-1]["attribute"]["slug"] == swatch_attribute.slug
+    assert data["attributes"][-1]["values"][0]["name"] == value
+    assert swatch_attribute.values.count() == values_count + 1
+    product_variant_updated.assert_called_once_with(product.variants.last())
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+def test_update_variant_with_swatch_attribute_no_values_given(
+    product_variant_updated,
+    permission_manage_products,
+    product,
+    product_type,
+    staff_api_client,
+    warehouse,
+    swatch_attribute,
+):
+    # given
+    product_type.variant_attributes.add(swatch_attribute)
+    query = QUERY_UPDATE_VARIANT_ATTRIBUTES
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    sku = "123"
+    swatch_attr_id = graphene.Node.to_global_id("Attribute", swatch_attribute.pk)
+
+    variables = {
+        "id": variant_id,
+        "sku": sku,
+        "attributes": [
+            {"id": swatch_attr_id},
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+
+    # then
+    content = get_graphql_content(response)["data"]["productVariantUpdate"]
+    variant.refresh_from_db()
+    data = content["productVariant"]
+
+    assert not content["errors"]
+    assert data["sku"] == sku
+    assert data["attributes"][-1]["attribute"]["slug"] == swatch_attribute.slug
+    assert not data["attributes"][-1]["values"]
 
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
@@ -770,7 +1371,7 @@ def test_update_variant_with_rich_text_attribute(
     rich_text_attribute_value.save()
     values_count = rich_text_attribute.values.count()
     associate_attribute_values_to_instance(
-        variant, rich_text_attribute, rich_text_attribute.values.first()
+        variant, {rich_text_attribute.id: [rich_text_attribute_value]}
     )
 
     response = staff_api_client.post_graphql(
@@ -818,7 +1419,7 @@ def test_update_variant_with_plain_text_attribute(
     plain_text_attribute_value.save()
     values_count = plain_text_attribute.values.count()
     associate_attribute_values_to_instance(
-        variant, plain_text_attribute, plain_text_attribute.values.first()
+        variant, {plain_text_attribute.id: [plain_text_attribute_value]}
     )
 
     # when
@@ -873,7 +1474,7 @@ def test_update_variant_with_plain_text_attribute_value_required(
 
     values_count = plain_text_attribute.values.count()
     associate_attribute_values_to_instance(
-        variant, plain_text_attribute, plain_text_attribute.values.first()
+        variant, {plain_text_attribute.id: [plain_text_attribute_value]}
     )
 
     # when
@@ -916,7 +1517,7 @@ def test_update_variant_with_required_plain_text_attribute_no_value(
     plain_text_attribute_value.save()
 
     associate_attribute_values_to_instance(
-        variant, plain_text_attribute, plain_text_attribute.values.first()
+        variant, {plain_text_attribute.id: [plain_text_attribute_value]}
     )
 
     plain_text_attribute.value_required = True
@@ -964,7 +1565,7 @@ def test_update_variant_with_date_attribute(
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     sku = "123"
     date_attribute_id = graphene.Node.to_global_id("Attribute", date_attribute.id)
-    date_time_value = datetime(2025, 5, 5, 5, 5, 5, tzinfo=pytz.utc)
+    date_time_value = datetime.datetime(2025, 5, 5, 5, 5, 5, tzinfo=datetime.UTC)
     date_value = date_time_value.date()
     date_values_count = date_attribute.values.count()
 
@@ -1027,7 +1628,7 @@ def test_update_variant_with_date_time_attribute(
     date_time_attribute_id = graphene.Node.to_global_id(
         "Attribute", date_time_attribute.id
     )
-    date_time_value = datetime(2025, 5, 5, 5, 5, 5, tzinfo=pytz.utc)
+    date_time_value = datetime.datetime(2025, 5, 5, 5, 5, 5, tzinfo=datetime.UTC)
     date_time_values_count = date_time_attribute.values.count()
 
     variables = {
@@ -1096,7 +1697,9 @@ def test_update_variant_with_numeric_attribute(
     attribute_value.slug = f"{variant.id}_{numeric_attribute.id}"
     attribute_value.save()
     values_count = numeric_attribute.values.count()
-    associate_attribute_values_to_instance(variant, numeric_attribute, attribute_value)
+    associate_attribute_values_to_instance(
+        variant, {numeric_attribute.id: [attribute_value]}
+    )
 
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_products]
@@ -1214,10 +1817,11 @@ def test_update_product_variant_with_duplicated_attribute(
     variant2.sku = str(uuid4())[:12]
     variant2.save()
     associate_attribute_values_to_instance(
-        variant2, color_attribute, color_attribute.values.last()
-    )
-    associate_attribute_values_to_instance(
-        variant2, size_attribute, size_attribute.values.last()
+        variant2,
+        {
+            color_attribute.id: [color_attribute.values.last()],
+            size_attribute.id: [size_attribute.values.last()],
+        },
     )
 
     assert variant.attributes.first().values.first().slug == "red"
@@ -1317,7 +1921,9 @@ def test_update_product_variant_with_duplicated_file_attribute(
     variant2.sku = str(uuid4())[:12]
     variant2.save()
     file_attr_value = file_attribute.values.last()
-    associate_attribute_values_to_instance(variant2, file_attribute, file_attr_value)
+    associate_attribute_values_to_instance(
+        variant2, {file_attribute.id: [file_attr_value]}
+    )
 
     sku = str(uuid4())[:12]
     assert not variant.sku == sku
@@ -1609,10 +2215,13 @@ def test_update_product_variant_change_attribute_values_ordering(
 
     associate_attribute_values_to_instance(
         variant,
-        product_type_product_reference_attribute,
-        attr_value_3,
-        attr_value_2,
-        attr_value_1,
+        {
+            product_type_product_reference_attribute.id: [
+                attr_value_3,
+                attr_value_2,
+                attr_value_1,
+            ]
+        },
     )
 
     assert list(
@@ -1666,11 +2275,11 @@ def test_update_product_variant_change_attribute_values_ordering(
 
 
 @pytest.mark.parametrize(
-    "values, message, code",
-    (
+    ("values", "message", "code"),
+    [
         (["one", "two"], "Attribute must take only one value.", "INVALID"),
         (["   "], "Attribute values cannot be blank.", "REQUIRED"),
-    ),
+    ],
 )
 def test_update_product_variant_requires_values(
     staff_api_client,
@@ -1706,9 +2315,9 @@ def test_update_product_variant_requires_values(
     )
     variant.refresh_from_db()
     content = get_graphql_content(response)
-    assert (
-        len(content["data"]["productVariantUpdate"]["errors"]) == 1
-    ), f"expected: {message}"
+    assert len(content["data"]["productVariantUpdate"]["errors"]) == 1, (
+        f"expected: {message}"
+    )
     assert content["data"]["productVariantUpdate"]["errors"][0] == {
         "field": "attributes",
         "message": message,
@@ -1872,7 +2481,7 @@ def test_update_product_variant_change_preorder_data(
     new_global_threshold = variant.preorder_global_threshold + 5
     assert variant.preorder_end_date is None
     new_preorder_end_date = (
-        (datetime.now() + timedelta(days=3))
+        (datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(days=3))
         .astimezone()
         .replace(microsecond=0)
         .isoformat()
@@ -1893,7 +2502,6 @@ def test_update_product_variant_change_preorder_data(
     )
     variant.refresh_from_db()
     content = get_graphql_content(response)
-    flush_post_commit_hooks()
     data = content["data"]["productVariantUpdate"]["productVariant"]
 
     assert data["sku"] == sku
@@ -1906,8 +2514,7 @@ def test_update_product_variant_can_not_turn_off_preorder(
     permission_manage_products,
     preorder_variant_global_threshold,
 ):
-    """Passing None with `preorder` field can not turn off preorder,
-    it could be done only with ProductVariantPreorderDeactivate mutation."""
+    """Test that preorder cannot be disabled through updating the `preorder` field directly."""
     variant = preorder_variant_global_threshold
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     sku = "test sku"
@@ -1921,9 +2528,289 @@ def test_update_product_variant_can_not_turn_off_preorder(
     )
     variant.refresh_from_db()
     content = get_graphql_content(response)
-    flush_post_commit_hooks()
     data = content["data"]["productVariantUpdate"]["productVariant"]
 
     assert data["sku"] == sku
     assert data["preorder"]["globalThreshold"] == variant.preorder_global_threshold
     assert data["preorder"]["endDate"] is None
+
+
+# Query used to check how Product Variant metadata updates behaves
+# and which events are emitted
+UPDATE_METADATA_QUERY = """
+        mutation updateVariant (
+            $id: ID!,
+            $input: ProductVariantInput!
+            ) {
+                productVariantUpdate(
+                     id: $id,
+                     input: $input
+                    ) {
+                    productVariant {
+                        id
+                        name
+                    }
+                }
+            }
+    """
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+@patch("saleor.plugins.manager.PluginsManager.product_variant_metadata_updated")
+def test_update_product_variant_with_metadata(
+    product_variant_metadata_updated_webhook_mock,
+    product_variant_updated_webhook_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    # Given
+    # - Variant metadata is empty
+
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    assert variant.metadata == {}
+    assert variant.private_metadata == {}
+
+    # When
+    # - Metadata is updated
+    # - No other attribute is updated
+    metadata_key = "mk"
+    metadata_value = "mv"
+
+    variant.name = "Name"
+
+    variables = {
+        "id": variant_id,
+        "input": {
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+        },
+    }
+
+    response = staff_api_client.post_graphql(
+        UPDATE_METADATA_QUERY, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]["productVariant"]
+
+    assert data["id"] == variant_id
+
+    # Then
+    # - Both variant_updated and variant_metadata_updated should run
+    # - Both should run only once
+    product_variant_updated_webhook_mock.assert_called_once_with(
+        product.variants.last()
+    )
+    product_variant_metadata_updated_webhook_mock.assert_called_once_with(
+        product.variants.last()
+    )
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+@patch("saleor.plugins.manager.PluginsManager.product_variant_metadata_updated")
+def test_update_product_variant_with_no_metadata_and_no_event(
+    product_variant_metadata_updated_webhook_mock,
+    product_variant_updated_webhook_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    # Given
+    # - Metadata in variant is empty
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    assert variant.metadata == {}
+    assert variant.private_metadata == {}
+
+    # When
+    # - Variant attribute is being updated
+    # - Metadata is NOT being updated
+    new_name = "New Name"
+    variables = {"id": variant_id, "input": {"name": new_name}}
+
+    response = staff_api_client.post_graphql(
+        UPDATE_METADATA_QUERY, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]["productVariant"]
+
+    assert data["id"] == variant_id
+    assert data["name"] == new_name
+
+    # Then
+    # - product_variant_updated should run - field changed
+    # - product_variant_metadata_updated should not run - metadata not changed,
+    # no empty event emitted
+    product_variant_updated_webhook_mock.assert_called_once_with(
+        product.variants.last()
+    )
+    product_variant_metadata_updated_webhook_mock.assert_not_called()
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+@patch("saleor.plugins.manager.PluginsManager.product_variant_metadata_updated")
+def test_update_product_variant_with_existing_metadata_and_no_event(
+    product_variant_metadata_updated_webhook_mock,
+    product_variant_updated_webhook_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    # Given
+    # - Metadata in variant is already existing
+    # - mutation doesn't provide metadata
+
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    variant.name = "Name"
+
+    variant.metadata = {
+        "Foo": "Bar",
+    }
+
+    variant.private_metadata = {
+        "Foo": "Bar",
+    }
+
+    variant.save()
+
+    # When
+    # - Variant attribute is being updated
+    # - Metadata is NOT being updated
+    new_name = "New Name"
+    variables = {"id": variant_id, "input": {"name": new_name}}
+
+    response = staff_api_client.post_graphql(
+        UPDATE_METADATA_QUERY, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]["productVariant"]
+
+    assert data["id"] == variant_id
+    assert data["name"] == new_name
+
+    # Then
+    # - product_variant_updated should run - field changed
+    # - product_variant_metadata_updated should not run - metadata not changed,
+    # no empty event emitted
+    product_variant_updated_webhook_mock.assert_called_once_with(
+        product.variants.last()
+    )
+    product_variant_metadata_updated_webhook_mock.assert_not_called()
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+@patch("saleor.plugins.manager.PluginsManager.product_variant_metadata_updated")
+def test_update_product_variant_with_existing_metadata_and_no_event_when_write_the_same(
+    product_variant_metadata_updated_webhook_mock,
+    product_variant_updated_webhook_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    # Given
+    # - Metadata in variant is already existing
+    # - mutation writes the same metadata key and value
+
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    metadata_key = "mk"
+    metadata_value = "mv"
+
+    variant.name = "Name"
+
+    variant.metadata = {metadata_key: metadata_value}
+
+    variant.private_metadata = {metadata_key: metadata_value}
+
+    variant.save()
+
+    assert variant.metadata == {metadata_key: metadata_value}
+
+    assert variant.private_metadata == {metadata_key: metadata_value}
+
+    # When
+    # - Metadata is updated with the same values
+    variables = {
+        "id": variant_id,
+        "input": {
+            "metadata": [{"key": metadata_key, "value": metadata_value}],
+            "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
+        },
+    }
+
+    response = staff_api_client.post_graphql(
+        UPDATE_METADATA_QUERY, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]["productVariant"]
+
+    assert data["id"] == variant_id
+
+    # Then
+    # - product_variant_updated should not run - nothing changed
+    # - product_variant_metadata_updated should not run - metadata not changed, values the same,
+    # no empty event emitted
+    product_variant_updated_webhook_mock.assert_not_called()
+    product_variant_metadata_updated_webhook_mock.assert_not_called()
+
+
+@patch("saleor.plugins.manager.PluginsManager.product_variant_updated")
+@patch("saleor.plugins.manager.PluginsManager.product_variant_metadata_updated")
+def test_update_product_variant_with_existing_metadata_and_event_when_write_different_value(
+    product_variant_metadata_updated_webhook_mock,
+    product_variant_updated_webhook_mock,
+    staff_api_client,
+    product,
+    permission_manage_products,
+):
+    # Given
+    # - Metadata in variant is already existing
+    # - mutation writes the same metadata key but different value
+
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    metadata_key = "mk"
+    metadata_value = "mv"
+
+    variant.name = "Name"
+    variant.metadata = {"key": metadata_key, "value": metadata_value}
+
+    variant.private_metadata = {"key": metadata_key, "value": metadata_value}
+
+    variant.save()
+
+    # When
+    # - Metadata is updated with the same values
+    variables = {
+        "id": variant_id,
+        "input": {
+            "metadata": [{"key": metadata_key, "value": "new value"}],
+            "privateMetadata": [{"key": metadata_key, "value": "new value"}],
+        },
+    }
+
+    response = staff_api_client.post_graphql(
+        UPDATE_METADATA_QUERY, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]["productVariant"]
+
+    assert data["id"] == variant_id
+
+    # Then
+    # - product_variant_updated should run - metadata value changed
+    # - product_variant_metadata_updated should  run - metadata value changed
+    # no empty event emitted
+    product_variant_updated_webhook_mock.assert_called_once()
+    product_variant_metadata_updated_webhook_mock.assert_called_once()

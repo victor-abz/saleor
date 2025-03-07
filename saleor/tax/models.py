@@ -54,10 +54,15 @@ class TaxConfiguration(ModelWithMetadata):
     )
     charge_taxes = models.BooleanField(default=True)
     tax_calculation_strategy = models.CharField(
-        max_length=20, choices=TaxCalculationStrategy.CHOICES, blank=True, null=True
+        max_length=20,
+        choices=TaxCalculationStrategy.CHOICES,
+        blank=True,
+        null=True,
+        default=TaxCalculationStrategy.FLAT_RATES,
     )
     display_gross_prices = models.BooleanField(default=True)
     prices_entered_with_tax = models.BooleanField(default=True)
+    tax_app_id = models.CharField(blank=True, null=True, max_length=256)
 
     class Meta:
         ordering = ("pk",)
@@ -73,6 +78,7 @@ class TaxConfigurationPerCountry(models.Model):
         max_length=20, choices=TaxCalculationStrategy.CHOICES, blank=True, null=True
     )
     display_gross_prices = models.BooleanField(default=True)
+    tax_app_id = models.CharField(blank=True, null=True, max_length=256)
 
     class Meta:
         ordering = ("country", "pk")

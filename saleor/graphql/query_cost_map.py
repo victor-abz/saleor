@@ -190,6 +190,9 @@ COST_MAP = {
         "permissions": {"complexity": 1},
         "users": {"complexity": 1},
     },
+    "Invoice": {
+        "order": {"complexity": 1},
+    },
     "Menu": {
         "items": {"complexity": 1},
     },
@@ -211,7 +214,7 @@ COST_MAP = {
         "events": {"complexity": 1},
         "fulfillments": {"complexity": 1},
         "giftCards": {"complexity": 1},
-        "invoices": {"complexity": 1},
+        "invoices": {"complexity": 10},
         "lines": {"complexity": 1},
         "payments": {"complexity": 1},
         "shippingAddress": {"complexity": 1},
@@ -253,6 +256,7 @@ COST_MAP = {
         "productType": {"complexity": 1},
         "thumbnail": {"complexity": 1},
         "variants": {"complexity": 1},
+        "productVariants": {"complexity": 1, "multipliers": ["first", "last"]},
     },
     "ProductChannelListing": {
         "channel": {"complexity": 1},
@@ -294,6 +298,7 @@ COST_MAP = {
     },
     "SelectedAttribute": {
         "attribute": {"complexity": 1},
+        "values": {"complexity": 1, "multipliers": ["first", "last"]},
     },
     "ShippingMethodChannelListing": {
         "channel": {"complexity": 1},

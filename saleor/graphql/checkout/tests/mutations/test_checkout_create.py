@@ -1,22 +1,24 @@
 import datetime
 import warnings
 from unittest import mock
+from unittest.mock import patch
 
 import graphene
 import pytest
-import pytz
 from django.test import override_settings
 from django.utils import timezone
 
-from .....account.models import Address
 from .....channel.utils import DEPRECATION_WARNING_MESSAGE
 from .....checkout import AddressType
+from .....checkout.actions import call_checkout_event
 from .....checkout.error_codes import CheckoutErrorCode
 from .....checkout.fetch import fetch_checkout_lines
 from .....checkout.models import Checkout
 from .....checkout.utils import calculate_checkout_quantity
-from .....product.models import ProductChannelListing
+from .....core.models import EventDelivery
+from .....product.models import ProductChannelListing, ProductVariantChannelListing
 from .....warehouse.models import Reservation, Stock
+from .....webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ....tests.utils import assert_no_permission, get_graphql_content
 
 MUTATION_CHECKOUT_CREATE = """
@@ -28,7 +30,27 @@ MUTATION_CHECKOUT_CREATE = """
           email
           quantity
           lines {
+            unitPrice {
+                gross {
+                    amount
+                }
+            }
+            totalPrice {
+                gross {
+                    amount
+                }
+            }
+            undiscountedTotalPrice {
+                amount
+            }
+            undiscountedUnitPrice {
+                amount
+            }
             quantity
+            variant {
+                id
+            }
+            isGift
           }
         }
         errors {
@@ -43,12 +65,11 @@ MUTATION_CHECKOUT_CREATE = """
 """
 
 
-@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
-def test_checkout_create_triggers_webhooks(
+def test_checkout_create_triggers_async_webhooks(
     mocked_webhook_trigger,
-    mocked_get_webhooks_for_event,
-    any_webhook,
+    webhook,
+    permission_manage_checkouts,
     user_api_client,
     stock,
     graphql_address_data,
@@ -56,7 +77,9 @@ def test_checkout_create_triggers_webhooks(
     channel_USD,
 ):
     """Create checkout object using GraphQL API."""
-    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    webhook.app.permissions.set([permission_manage_checkouts])
+    webhook.events.create(event_type=WebhookEventAsyncType.CHECKOUT_CREATED)
+
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
@@ -101,38 +124,7 @@ def test_checkout_create_with_default_channel(
     assert new_checkout.channel == channel_USD
     assert calculate_checkout_quantity(lines) == quantity
 
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
-
-
-def test_checkout_create_with_variant_without_sku(
-    api_client, stock, graphql_address_data, channel_USD
-):
-    variant = stock.product_variant
-    variant.sku = None
-    variant.save()
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
-    test_email = "test@example.com"
-    shipping_address = graphql_address_data
-    quantity = 1
-    variables = {
-        "checkoutInput": {
-            "channel": channel_USD.slug,
-            "lines": [{"quantity": quantity, "variantId": variant_id}],
-            "email": test_email,
-            "shippingAddress": shipping_address,
-        }
-    }
-    assert not Checkout.objects.exists()
-    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-    get_graphql_content(response)["data"]["checkoutCreate"]
-
-    new_checkout = Checkout.objects.first()
-    lines, _ = fetch_checkout_lines(new_checkout)
-    assert new_checkout.channel == channel_USD
-    assert calculate_checkout_quantity(lines) == quantity
-    assert lines[0].variant.sku is None
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)
 
 
 def test_checkout_create_with_inactive_channel(
@@ -213,10 +205,60 @@ def test_checkout_create_with_unavailable_variant(
     assert error["variants"] == [variant_id]
 
 
+@pytest.mark.parametrize(
+    ("channel_listing_model", "listing_filter_field", "expected_error_code"),
+    [
+        (
+            ProductVariantChannelListing,
+            "variant_id",
+            CheckoutErrorCode.UNAVAILABLE_VARIANT_IN_CHANNEL.name,
+        ),
+        (
+            ProductChannelListing,
+            "product__variants__id",
+            CheckoutErrorCode.PRODUCT_UNAVAILABLE_FOR_PURCHASE.name,
+        ),
+    ],
+)
+def test_checkout_create_with_line_without_channel_listing(
+    channel_listing_model,
+    listing_filter_field,
+    expected_error_code,
+    api_client,
+    stock,
+    graphql_address_data,
+    channel_USD,
+):
+    variant = stock.product_variant
+
+    channel_listing_model.objects.filter(
+        channel_id=channel_USD.id, **{listing_filter_field: variant.id}
+    ).delete()
+
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    test_email = "test@example.com"
+    shipping_address = graphql_address_data
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "email": test_email,
+            "shippingAddress": shipping_address,
+        }
+    }
+
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+
+    error = get_graphql_content(response)["data"]["checkoutCreate"]["errors"][0]
+
+    assert error["field"] == "lines"
+    assert error["code"] == expected_error_code
+    assert error["variants"] == [variant_id]
+
+
 def test_checkout_create_with_malicious_variant_id(
     api_client, stock, graphql_address_data, channel_USD
 ):
-
     variant = stock.product_variant
     variant.channel_listings.filter(channel=channel_USD).update(price_amount=None)
     test_email = "test@example.com"
@@ -272,9 +314,7 @@ def test_checkout_create_with_inactive_default_channel(
 
     assert new_checkout.channel == channel_USD
 
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)
 
 
 def test_checkout_create_with_inactive_and_active_default_channel(
@@ -304,9 +344,7 @@ def test_checkout_create_with_inactive_and_active_default_channel(
 
     assert new_checkout.channel == channel_USD
 
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)
 
 
 def test_checkout_create_with_inactive_and_two_active_default_channel(
@@ -440,6 +478,35 @@ def test_checkout_create_with_multiple_channel_with_channel_slug(
     assert checkout_line.quantity == 1
 
 
+def test_checkout_create_with_variant_without_sku(
+    api_client, stock, graphql_address_data, channel_USD
+):
+    variant = stock.product_variant
+    variant.sku = None
+    variant.save()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    test_email = "test@example.com"
+    shipping_address = graphql_address_data
+    quantity = 1
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": quantity, "variantId": variant_id}],
+            "email": test_email,
+            "shippingAddress": shipping_address,
+        }
+    }
+    assert not Checkout.objects.exists()
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+    get_graphql_content(response)["data"]["checkoutCreate"]
+
+    new_checkout = Checkout.objects.first()
+    lines, _ = fetch_checkout_lines(new_checkout)
+    assert new_checkout.channel == channel_USD
+    assert calculate_checkout_quantity(lines) == quantity
+    assert lines[0].variant.sku is None
+
+
 def test_checkout_create_with_existing_checkout_in_other_channel(
     user_api_client, stock, graphql_address_data, channel_USD, user_checkout_PLN
 ):
@@ -497,13 +564,20 @@ def test_checkout_create(api_client, stock, graphql_address_data, channel_USD):
     variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     test_email = "test@example.com"
-    shipping_address = graphql_address_data
+    billing_metadata = [{"key": "billing", "value": "billing_value"}]
+    shipping_metadata = [{"key": "shipping", "value": "shipping_value"}]
+    shipping_address_data = graphql_address_data.copy()
+    billing_address_data = graphql_address_data.copy()
+    shipping_address_data["metadata"] = shipping_metadata
+    billing_address_data["metadata"] = billing_metadata
+
     variables = {
         "checkoutInput": {
             "channel": channel_USD.slug,
             "lines": [{"quantity": 1, "variantId": variant_id}],
             "email": test_email,
-            "shippingAddress": shipping_address,
+            "shippingAddress": shipping_address_data,
+            "billingAddress": billing_address_data,
         }
     }
     assert not Checkout.objects.exists()
@@ -518,21 +592,34 @@ def test_checkout_create(api_client, stock, graphql_address_data, channel_USD):
     checkout_line = new_checkout.lines.first()
     assert checkout_line.variant == variant
     assert checkout_line.quantity == 1
+    assert new_checkout.billing_address is not None
     assert new_checkout.shipping_address is not None
-    assert new_checkout.shipping_address.first_name == shipping_address["firstName"]
-    assert new_checkout.shipping_address.last_name == shipping_address["lastName"]
+    assert new_checkout.save_shipping_address is True
+    assert new_checkout.save_billing_address is True
+    assert (
+        new_checkout.shipping_address.first_name == shipping_address_data["firstName"]
+    )
+    assert new_checkout.shipping_address.last_name == shipping_address_data["lastName"]
     assert (
         new_checkout.shipping_address.street_address_1
-        == shipping_address["streetAddress1"]
+        == shipping_address_data["streetAddress1"]
     )
     assert (
         new_checkout.shipping_address.street_address_2
-        == shipping_address["streetAddress2"]
+        == shipping_address_data["streetAddress2"]
     )
-    assert new_checkout.shipping_address.postal_code == shipping_address["postalCode"]
-    assert new_checkout.shipping_address.country == shipping_address["country"]
-    assert new_checkout.shipping_address.city == shipping_address["city"].upper()
+    assert (
+        new_checkout.shipping_address.postal_code == shipping_address_data["postalCode"]
+    )
+    assert new_checkout.shipping_address.country == shipping_address_data["country"]
+    assert new_checkout.shipping_address.city == shipping_address_data["city"].upper()
     assert not Reservation.objects.exists()
+
+    assert new_checkout.shipping_address.metadata == {"shipping": "shipping_value"}
+    assert new_checkout.billing_address.metadata == {"billing": "billing_value"}
+
+    assert new_checkout.billing_address.validation_skipped is False
+    assert new_checkout.shipping_address.validation_skipped is False
 
 
 def test_checkout_create_with_custom_price(
@@ -571,6 +658,106 @@ def test_checkout_create_with_custom_price(
     assert checkout_line.variant == variant
     assert checkout_line.quantity == 1
     assert checkout_line.price_override == price
+
+
+def test_checkout_create_with_custom_price_and_catalogue_promotion(
+    app_api_client,
+    variant_on_promotion,
+    channel_USD,
+    permission_handle_checkouts,
+):
+    """Ensure that catalogue promotion is applied on custom price."""
+    # given
+    variant = variant_on_promotion
+
+    promotion_rule = variant.channel_listings.get(
+        channel=channel_USD
+    ).promotion_rules.first()
+    reward_value = promotion_rule.reward_value
+
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    test_email = "test@example.com"
+    price = 12
+    quantity = 2
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": quantity, "variantId": variant_id, "price": price}],
+            "email": test_email,
+        }
+    }
+    assert not Checkout.objects.exists()
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_CHECKOUT_CREATE, variables, permissions=[permission_handle_checkouts]
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["checkoutCreate"]
+    assert not data["errors"]
+    assert len(data["checkout"]["lines"]) == 1
+
+    unit_discount = price * reward_value / 100
+    line_data = data["checkout"]["lines"][0]
+    assert line_data["quantity"] == quantity
+    assert line_data["undiscountedUnitPrice"]["amount"] == price
+    assert line_data["undiscountedTotalPrice"]["amount"] == price * quantity
+    assert line_data["unitPrice"]["gross"]["amount"] == price - unit_discount
+    assert (
+        line_data["totalPrice"]["gross"]["amount"] == (price - unit_discount) * quantity
+    )
+
+    checkout = Checkout.objects.first()
+    line = checkout.lines.first()
+    assert line.discounts.count() == 1
+    line_discount = line.discounts.first()
+    assert line_discount.amount_value == unit_discount * quantity
+    assert line_discount.value == reward_value
+    assert line_discount.value_type == promotion_rule.reward_value_type
+
+
+def test_checkout_create_with_gift_reward(
+    api_client, stock, channel_USD, gift_promotion_rule
+):
+    # given
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    test_email = "test@example.com"
+    quantity = 5
+
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": quantity, "variantId": variant_id}],
+            "email": test_email,
+        }
+    }
+    assert not Checkout.objects.exists()
+
+    # when
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+    content = get_graphql_content(response)["data"]["checkoutCreate"]
+
+    # then
+    new_checkout = Checkout.objects.first()
+    assert new_checkout is not None
+    checkout_data = content["checkout"]
+    assert checkout_data["token"] == str(new_checkout.token)
+    assert new_checkout.lines.count() == len(checkout_data["lines"]) == 2
+    checkout_line_data = [
+        line for line in checkout_data["lines"] if line["isGift"] is False
+    ][0]
+    assert checkout_line_data["quantity"] == quantity
+    gift_line_data = [
+        line for line in checkout_data["lines"] if line["isGift"] is True
+    ][0]
+    assert gift_line_data["quantity"] == 1
+    gift_line = new_checkout.lines.get(is_gift=True)
+    assert gift_line.discounts.count() == 1
+    discount = gift_line.discounts.first()
+    gift_variant_listing = gift_line.variant.channel_listings.get(channel=channel_USD)
+    assert discount.amount_value == gift_variant_listing.price_amount
 
 
 def test_checkout_create_with_metadata_in_line(
@@ -619,8 +806,6 @@ def test_checkout_create_with_custom_price_duplicated_items(
     channel_USD,
     permission_handle_checkouts,
 ):
-    """Ensure that when the same item with a custom price is provided multiple times,
-    the price from the last occurrence will be set."""
     variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     test_email = "test@example.com"
@@ -1024,8 +1209,8 @@ def test_checkout_create_with_variant_without_inventory_tracking(
 
 
 @pytest.mark.parametrize(
-    "quantity, expected_error_message, error_code",
-    (
+    ("quantity", "expected_error_message", "error_code"),
+    [
         (
             -1,
             "The quantity should be higher than zero.",
@@ -1036,7 +1221,7 @@ def test_checkout_create_with_variant_without_inventory_tracking(
             "Cannot add more than 50 times this item: SKU_A.",
             CheckoutErrorCode.QUANTITY_GREATER_THAN_LIMIT,
         ),
-    ),
+    ],
 )
 def test_checkout_create_cannot_add_invalid_quantities(
     api_client,
@@ -1394,9 +1579,6 @@ def test_checkout_create_check_lines_quantity_for_zone_insufficient_stocks(
     graphql_address_data,
     channel_USD,
 ):
-    """Check if insufficient stock exception will be raised.
-    If item from checkout will not have enough quantity in correct shipping zone for
-    shipping address INSUFICIENT_STOCK checkout error should be raised."""
     variant = variant_with_many_stocks_different_shipping_zones
     Stock.objects.filter(
         warehouse__shipping_zones__countries__contains="US", product_variant=variant
@@ -1628,6 +1810,9 @@ def test_checkout_create_check_lines_quantity_against_reservations(
     checkout_line = checkout.lines.create(
         variant=variant,
         quantity=3,
+        undiscounted_unit_price_amount=variant.channel_listings.get(
+            channel=channel_USD
+        ).price_amount,
     )
     Reservation.objects.create(
         checkout_line=checkout_line,
@@ -1701,7 +1886,7 @@ def test_checkout_create_available_for_purchase_from_tomorrow_product(
     product = variant.product
 
     product.channel_listings.update(
-        available_for_purchase_at=datetime.datetime.now(pytz.UTC)
+        available_for_purchase_at=datetime.datetime.now(tz=datetime.UTC)
         + datetime.timedelta(days=1)
     )
 
@@ -1768,7 +1953,7 @@ def test_create_checkout_with_unpublished_product(
 
 
 @pytest.mark.parametrize(
-    "address_data, address_input_name, address_db_field_name",
+    ("address_data", "address_input_name", "address_db_field_name"),
     [
         (
             {"country": "PL"},  # missing postalCode, streetAddress
@@ -1799,7 +1984,6 @@ def test_create_checkout_with_unpublished_product(
             "billingAddress",
             "billing_address",
         ),
-        ({"country": "US"}, "shippingAddress", "shipping_address"),
         (
             {
                 "country": "US",
@@ -1878,7 +2062,7 @@ def test_checkout_create_with_skip_required_raises_validation_error(
 
 
 @pytest.mark.parametrize(
-    "address_input_name, address_db_field_name",
+    ("address_input_name", "address_db_field_name"),
     [("shippingAddress", "shipping_address"), ("billingAddress", "billing_address")],
 )
 def test_checkout_create_with_skip_required_saves_address(
@@ -1913,7 +2097,7 @@ def test_checkout_create_with_skip_required_saves_address(
 
 
 @pytest.mark.parametrize(
-    "address_data, address_input_name, address_db_field_name",
+    ("address_data", "address_input_name", "address_db_field_name"),
     [
         (
             {
@@ -1994,7 +2178,7 @@ def test_checkout_create_with_skip_value_check_doesnt_raise_error(
 
 
 @pytest.mark.parametrize(
-    "address_data, address_input_name",
+    ("address_data", "address_input_name"),
     [
         (
             {
@@ -2062,7 +2246,7 @@ def test_checkout_create_with_skip_value_raises_required_fields_error(
 
 
 @pytest.mark.parametrize(
-    "address_input_name, address_db_field_name",
+    ("address_input_name", "address_db_field_name"),
     [("shippingAddress", "shipping_address"), ("billingAddress", "billing_address")],
 )
 def test_checkout_create_with_skip_value_check_saves_address(
@@ -2111,11 +2295,8 @@ def test_checkout_create_with_skip_value_check_saves_address(
     assert getattr(created_checkout, address_db_field_name).country.code == country_code
 
 
-[("shippingAddress", "shipping_address"), ("billingAddress", "billing_address")],
-
-
 @pytest.mark.parametrize(
-    "address_data, address_input_name, address_db_field_name",
+    ("address_data", "address_input_name", "address_db_field_name"),
     [
         (
             {
@@ -2191,7 +2372,7 @@ def test_checkout_create_with_skip_value_and_skip_required_fields(
 
 
 @pytest.mark.parametrize(
-    "address_input_name, address_db_field_name",
+    ("address_input_name", "address_db_field_name"),
     [("shippingAddress", "shipping_address"), ("billingAddress", "billing_address")],
 )
 def test_checkout_create_with_skip_value_and_skip_required_saves_address(
@@ -2359,43 +2540,373 @@ def test_checkout_create_with_disabled_fields_normalization_raises_required_erro
     assert data["errors"][0]["code"] == "REQUIRED"
 
 
-@pytest.mark.parametrize("with_shipping_address", (True, False))
-def test_create_checkout_with_digital(
-    api_client,
-    digital_content,
-    graphql_address_data,
-    with_shipping_address,
-    channel_USD,
+MUTATION_CHECKOUT_CREATE_WITH_ADDRESSES = """
+    mutation createCheckout($checkoutInput: CheckoutCreateInput!) {
+      checkoutCreate(input: $checkoutInput) {
+        checkout {
+          id
+          shippingAddress {
+            postalCode
+          }
+          billingAddress {
+            postalCode
+          }
+        }
+        errors {
+          field
+          message
+          code
+        }
+      }
+    }
+"""
+
+
+def test_checkout_create_skip_validation_shipping_address_by_customer(
+    api_client, stock, graphql_address_data_skipped_validation, channel_USD
 ):
-    """Test creating a checkout with a shipping address gets the address ignored."""
+    # given
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    shipping_address = graphql_address_data_skipped_validation
+    invalid_postal_code = "invalid_postal_code"
+    shipping_address["postalCode"] = invalid_postal_code
 
-    address_count = Address.objects.count()
-
-    variant = digital_content.product_variant
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-
-    checkout_input = {
-        "channel": channel_USD.slug,
-        "lines": [{"quantity": 1, "variantId": variant_id}],
-        "email": "customer@example.com",
+    variables = {
+        "checkoutInput": {
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "email": "test@example.com",
+            "shippingAddress": shipping_address,
+            "channel": channel_USD.slug,
+        }
     }
 
-    if with_shipping_address:
-        checkout_input["shippingAddress"] = graphql_address_data
+    # when
+    response = api_client.post_graphql(
+        MUTATION_CHECKOUT_CREATE_WITH_ADDRESSES, variables
+    )
 
-    get_graphql_content(
-        api_client.post_graphql(
-            MUTATION_CHECKOUT_CREATE, {"checkoutInput": checkout_input}
-        )
-    )["data"]["checkoutCreate"]
+    # then
+    assert_no_permission(response)
 
-    # Retrieve the created checkout
-    checkout = Checkout.objects.get()
 
-    # Check that the shipping address was ignored, thus not created
-    assert (
-        checkout.shipping_address is None
-    ), "The address shouldn't have been associated"
-    assert (
-        Address.objects.count() == address_count
-    ), "No address should have been created"
+def test_checkout_create_skip_validation_shipping_address_by_app(
+    app_api_client,
+    stock,
+    graphql_address_data_skipped_validation,
+    channel_USD,
+    permission_handle_checkouts,
+):
+    # given
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    shipping_address = graphql_address_data_skipped_validation
+    invalid_postal_code = "invalid_postal_code"
+    shipping_address["postalCode"] = invalid_postal_code
+
+    variables = {
+        "checkoutInput": {
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "email": "test@example.com",
+            "shippingAddress": shipping_address,
+            "channel": channel_USD.slug,
+        }
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_CHECKOUT_CREATE_WITH_ADDRESSES,
+        variables,
+        permissions=[permission_handle_checkouts],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["checkoutCreate"]
+    assert not data["errors"]
+    assert data["checkout"]["shippingAddress"]["postalCode"] == invalid_postal_code
+    new_checkout = Checkout.objects.first()
+    assert new_checkout.shipping_address.postal_code == invalid_postal_code
+    assert new_checkout.shipping_address.validation_skipped is True
+
+
+def test_checkout_create_skip_validation_billing_address_by_customer(
+    api_client, stock, graphql_address_data_skipped_validation, channel_USD
+):
+    # given
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    billing_address = graphql_address_data_skipped_validation
+    invalid_postal_code = "invalid_postal_code"
+    billing_address["postalCode"] = invalid_postal_code
+
+    variables = {
+        "checkoutInput": {
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "email": "test@example.com",
+            "billingAddress": billing_address,
+            "channel": channel_USD.slug,
+        }
+    }
+
+    # when
+    response = api_client.post_graphql(
+        MUTATION_CHECKOUT_CREATE_WITH_ADDRESSES, variables
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_checkout_create_skip_validation_billing_address_by_app(
+    app_api_client,
+    stock,
+    graphql_address_data_skipped_validation,
+    channel_USD,
+    permission_handle_checkouts,
+):
+    # given
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    billing_address = graphql_address_data_skipped_validation
+    invalid_postal_code = "invalid_postal_code"
+    billing_address["postalCode"] = invalid_postal_code
+
+    variables = {
+        "checkoutInput": {
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "email": "test@example.com",
+            "billingAddress": billing_address,
+            "channel": channel_USD.slug,
+        }
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        MUTATION_CHECKOUT_CREATE_WITH_ADDRESSES,
+        variables,
+        permissions=[permission_handle_checkouts],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["checkoutCreate"]
+    assert not data["errors"]
+    assert data["checkout"]["billingAddress"]["postalCode"] == invalid_postal_code
+    new_checkout = Checkout.objects.first()
+    assert new_checkout.billing_address.postal_code == invalid_postal_code
+    assert new_checkout.billing_address.validation_skipped is True
+
+
+@patch(
+    "saleor.graphql.checkout.mutations.checkout_create.call_checkout_event",
+    wraps=call_checkout_event,
+)
+@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
+@patch(
+    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
+)
+@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
+def test_checkout_create_triggers_webhooks(
+    mocked_send_webhook_request_async,
+    mocked_send_webhook_request_sync,
+    wrapped_call_checkout_event,
+    api_client,
+    stock,
+    graphql_address_data,
+    channel_USD,
+    setup_checkout_webhooks,
+    settings,
+):
+    # given
+    mocked_send_webhook_request_sync.return_value = None
+    (
+        tax_webhook,
+        shipping_webhook,
+        shipping_filter_webhook,
+        checkout_created_webhook,
+    ) = setup_checkout_webhooks(WebhookEventAsyncType.CHECKOUT_CREATED)
+
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    test_email = "test@example.com"
+    billing_metadata = [{"key": "billing", "value": "billing_value"}]
+    shipping_metadata = [{"key": "shipping", "value": "shipping_value"}]
+    shipping_address_data = graphql_address_data.copy()
+    billing_address_data = graphql_address_data.copy()
+    shipping_address_data["metadata"] = shipping_metadata
+    billing_address_data["metadata"] = billing_metadata
+
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "email": test_email,
+            "shippingAddress": shipping_address_data,
+            "billingAddress": billing_address_data,
+        }
+    }
+
+    # when
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+
+    # then
+    content = get_graphql_content(response)
+    assert not content["data"]["checkoutCreate"]["errors"]
+
+    assert wrapped_call_checkout_event.called
+
+    # confirm that event delivery was generated for each async webhook.
+    checkout_create_delivery = EventDelivery.objects.get(
+        webhook_id=checkout_created_webhook.id
+    )
+    mocked_send_webhook_request_async.assert_called_once_with(
+        kwargs={"event_delivery_id": checkout_create_delivery.id},
+        queue=settings.CHECKOUT_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
+        bind=True,
+        retry_backoff=10,
+        retry_kwargs={"max_retries": 5},
+    )
+
+    # confirm each sync webhook was called without saving event delivery
+    assert mocked_send_webhook_request_sync.call_count == 3
+    assert not EventDelivery.objects.exclude(
+        webhook_id=checkout_created_webhook.id
+    ).exists()
+
+    sync_deliveries = {
+        call.args[0].event_type: call.args[0]
+        for call in mocked_send_webhook_request_sync.mock_calls
+    }
+
+    assert WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT in sync_deliveries
+    shipping_methods_delivery = sync_deliveries[
+        WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT
+    ]
+    assert shipping_methods_delivery.webhook_id == shipping_webhook.id
+
+    assert WebhookEventSyncType.CHECKOUT_FILTER_SHIPPING_METHODS in sync_deliveries
+    filter_shipping_delivery = sync_deliveries[
+        WebhookEventSyncType.CHECKOUT_FILTER_SHIPPING_METHODS
+    ]
+    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
+
+    assert WebhookEventSyncType.CHECKOUT_CALCULATE_TAXES in sync_deliveries
+    tax_delivery = sync_deliveries[WebhookEventSyncType.CHECKOUT_CALCULATE_TAXES]
+    assert tax_delivery.webhook_id == tax_webhook.id
+
+
+@pytest.mark.parametrize(
+    ("save_shipping_address", "save_billing_address"),
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_checkout_create_with_save_addresses_setting_provided(
+    save_shipping_address,
+    save_billing_address,
+    api_client,
+    stock,
+    graphql_address_data,
+    channel_USD,
+):
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    # given input with provided shipping, billing addresses with save settings
+    shipping_address_data = graphql_address_data.copy()
+    billing_address_data = graphql_address_data.copy()
+
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "shippingAddress": shipping_address_data,
+            "billingAddress": billing_address_data,
+            "saveShippingAddress": save_shipping_address,
+            "saveBillingAddress": save_billing_address,
+        }
+    }
+    assert not Checkout.objects.exists()
+
+    # when checkout create is called with provided variables
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+
+    # then the addresses with save settings are set
+    content = get_graphql_content(response)["data"]["checkoutCreate"]
+    assert not content["errors"]
+    new_checkout = Checkout.objects.first()
+    assert new_checkout is not None
+    checkout_data = content["checkout"]
+    assert checkout_data["token"] == str(new_checkout.token)
+    assert new_checkout.billing_address is not None
+    assert new_checkout.shipping_address is not None
+    assert new_checkout.save_billing_address == save_billing_address
+    assert new_checkout.save_shipping_address == save_shipping_address
+    assert not Reservation.objects.exists()
+
+    assert new_checkout.billing_address.validation_skipped is False
+    assert new_checkout.shipping_address.validation_skipped is False
+
+
+@pytest.mark.parametrize("save_shipping_address", [True, False])
+def test_checkout_create_no_shipping_address_providing_save_address_raising_error(
+    save_shipping_address, api_client, graphql_address_data, channel_USD, stock
+):
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    # given input with save shipping address and shipping method not provided
+    billing_address_data = graphql_address_data.copy()
+
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "billingAddress": billing_address_data,
+            "saveShippingAddress": save_shipping_address,
+        }
+    }
+    assert not Checkout.objects.exists()
+
+    # when checkout create is called with provided variables
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+
+    # then the error is raised
+    data = get_graphql_content(response)["data"]["checkoutCreate"]
+    assert not data["checkout"]
+    errors = data["errors"]
+    assert len(errors) == 1
+
+    error = errors[0]
+    assert error["field"] == "saveShippingAddress"
+    assert error["code"] == CheckoutErrorCode.MISSING_ADDRESS_DATA.name
+
+
+@pytest.mark.parametrize("save_billing_address", [True, False])
+def test_checkout_create_no_billing_address_providing_save_address_raising_error(
+    save_billing_address, api_client, graphql_address_data, channel_USD, stock
+):
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    # given input with save shipping address and shipping method not provided
+    shipping_address_data = graphql_address_data.copy()
+
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "shippingAddress": shipping_address_data,
+            "saveBillingAddress": save_billing_address,
+        }
+    }
+    assert not Checkout.objects.exists()
+
+    # when checkout create is called with provided variables
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+
+    # then the error is raised
+    data = get_graphql_content(response)["data"]["checkoutCreate"]
+    assert not data["checkout"]
+    errors = data["errors"]
+    assert len(errors) == 1
+
+    error = errors[0]
+    assert error["field"] == "saveBillingAddress"
+    assert error["code"] == CheckoutErrorCode.MISSING_ADDRESS_DATA.name

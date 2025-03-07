@@ -30,6 +30,10 @@ class CheckoutErrorCode(Enum):
     EMAIL_NOT_SET = "email_not_set"
     NO_LINES = "no_lines"
     INACTIVE_PAYMENT = "inactive_payment"
+    NON_EDITABLE_GIFT_LINE = "non_editable_gift_line"
+    NON_REMOVABLE_GIFT_LINE = "non_removable_gift_line"
+    SHIPPING_CHANGE_FORBIDDEN = "shipping_change_forbidden"
+    MISSING_ADDRESS_DATA = "missing_address_data"
 
 
 class OrderCreateFromCheckoutErrorCode(Enum):
@@ -47,3 +51,20 @@ class OrderCreateFromCheckoutErrorCode(Enum):
     NO_LINES = "no_lines"
     EMAIL_NOT_SET = "email_not_set"
     UNAVAILABLE_VARIANT_IN_CHANNEL = "unavailable_variant_in_channel"
+
+
+class CheckoutCreateFromOrderErrorCode(Enum):
+    GRAPHQL_ERROR = "graphql_error"
+    INVALID = "invalid"
+    ORDER_NOT_FOUND = "order_not_found"
+    CHANNEL_INACTIVE = "channel_inactive"
+    TAX_ERROR = "tax_error"
+
+
+class CheckoutCreateFromOrderUnavailableVariantErrorCode(Enum):
+    NOT_FOUND = "not_found"
+    PRODUCT_UNAVAILABLE_FOR_PURCHASE = "product_unavailable_for_purchase"
+    UNAVAILABLE_VARIANT_IN_CHANNEL = "unavailable_variant_in_channel"
+    PRODUCT_NOT_PUBLISHED = "product_not_published"
+    QUANTITY_GREATER_THAN_LIMIT = "quantity_greater_than_limit"
+    INSUFFICIENT_STOCK = "insufficient_stock"

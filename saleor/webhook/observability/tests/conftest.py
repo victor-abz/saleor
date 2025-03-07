@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+import json
 from unittest.mock import patch
 
 import fakeredis
@@ -22,9 +22,9 @@ KEY, MAX_SIZE, BATCH_SIZE = get_buffer_name(), 10, 5
 def gql_operation_factory():
     def factory(
         query_string: str,
-        operation_name: Optional[str] = None,
-        variables: Optional[Dict] = None,
-        result: Optional[Dict] = None,
+        operation_name: str | None = None,
+        variables: dict | None = None,
+        result: dict | None = None,
         result_invalid=False,
     ) -> GraphQLOperationResponse:
         query = backend.document_from_string(schema, query_string)
@@ -40,7 +40,7 @@ def gql_operation_factory():
 
 
 @pytest.fixture
-def clear_cache():
+def _clear_cache():
     yield
     cache.clear()
 
@@ -72,3 +72,8 @@ def patch_connection_pool(redis_server):
 def buffer(patch_connection_pool):
     buffer = RedisBuffer(BROKER_URL, KEY, max_size=MAX_SIZE, batch_size=BATCH_SIZE)
     return buffer
+
+
+@pytest.fixture
+def event_data():
+    return json.dumps({"event": "data"}).encode("utf-8")

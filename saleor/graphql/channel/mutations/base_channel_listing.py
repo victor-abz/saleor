@@ -1,16 +1,17 @@
 import datetime
-from typing import DefaultDict, Dict, Iterable, List
+from collections import defaultdict
+from collections.abc import Iterable
 
-import pytz
 from django.core.exceptions import ValidationError
 
 from ....channel import models
 from ....core.utils.date_time import convert_to_utc_date_time
+from ...core import ResolveInfo
 from ...core.mutations import BaseMutation
 from ...core.utils import get_duplicated_values, get_duplicates_items
 from ..types import Channel
 
-ErrorType = DefaultDict[str, List[ValidationError]]
+ErrorType = defaultdict[str, list[ValidationError]]
 
 
 class BaseChannelListingMutation(BaseMutation):
@@ -30,8 +31,7 @@ class BaseChannelListingMutation(BaseMutation):
         duplicated_ids = get_duplicates_items(add_channels_ids, remove_channels_ids)
         if duplicated_ids:
             error_msg = (
-                "The same object cannot be in both lists "
-                "for adding and removing items."
+                "The same object cannot be in both lists for adding and removing items."
             )
             errors["input"].append(
                 ValidationError(
@@ -57,8 +57,13 @@ class BaseChannelListingMutation(BaseMutation):
 
     @classmethod
     def clean_channels(
-        cls, info, input, errors: ErrorType, error_code, input_source="add_channels"
-    ) -> Dict:
+        cls,
+        info: ResolveInfo,
+        input,
+        errors: ErrorType,
+        error_code,
+        input_source="add_channels",
+    ) -> dict:
         add_channels = input.get(input_source, [])
         add_channels_ids = [channel["channel_id"] for channel in add_channels]
         remove_channels_ids = input.get("remove_channels", [])
@@ -71,24 +76,27 @@ class BaseChannelListingMutation(BaseMutation):
         cls.validate_duplicated_channel_values(
             remove_channels_ids, "remove_channels", errors, error_code
         )
-
         if errors:
             return {}
-        channels_to_add: List["models.Channel"] = []
+        channels_to_add: list[models.Channel] = []
         if add_channels_ids:
-            channels_to_add = cls.get_nodes_or_error(  # type: ignore
+            channels_to_add = cls.get_nodes_or_error(
                 add_channels_ids, "channel_id", Channel
             )
-        remove_channels_pks = cls.get_global_ids_or_error(
-            remove_channels_ids, Channel, field="remove_channels"
-        )
+        if remove_channels_ids:
+            remove_channels_pks = cls.get_global_ids_or_error(
+                remove_channels_ids, Channel, field="remove_channels"
+            )
+        else:
+            remove_channels_pks = []
 
         cleaned_input = {input_source: [], "remove_channels": remove_channels_pks}
 
-        for channel_listing, channel in zip(add_channels, channels_to_add):
+        for channel_listing, channel in zip(
+            add_channels, channels_to_add, strict=False
+        ):
             channel_listing["channel"] = channel
             cleaned_input[input_source].append(channel_listing)
-
         return cleaned_input
 
     @classmethod
@@ -109,7 +117,7 @@ class BaseChannelListingMutation(BaseMutation):
             )
             is_published = add_channel.get("is_published")
             if is_published and not publication_date:
-                add_channel["published_at"] = datetime.datetime.now(pytz.UTC)
+                add_channel["published_at"] = datetime.datetime.now(tz=datetime.UTC)
             elif "publication_date" in add_channel or "published_at" in add_channel:
                 add_channel["published_at"] = publication_date
         if invalid_channels:

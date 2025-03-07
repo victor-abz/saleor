@@ -1,10 +1,10 @@
-from typing import List
-
 from celery.utils.log import get_task_logger
+from django.conf import settings
 
 from ..account.models import User
 from ..account.search import prepare_user_search_document_value
 from ..celeryconf import app
+from ..core.db.connection import allow_writer
 from ..order.models import Order
 from ..order.search import prepare_order_search_vector_value
 from ..product.models import Product
@@ -26,18 +26,20 @@ BATCH_SIZE = 500
 @app.task
 def set_user_search_document_values(updated_count: int = 0) -> None:
     users = list(
-        User.objects.filter(search_document="")
+        User.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(search_document="")
         .prefetch_related("addresses")
-        .order_by()[:BATCH_SIZE]
+        .order_by("-id")[:BATCH_SIZE]
     )
 
     if not users:
         task_logger.info("No users to update.")
         return
 
-    updated_count += set_search_document_values(
-        users, prepare_user_search_document_value
-    )
+    with allow_writer():
+        updated_count += set_search_document_values(
+            users, prepare_user_search_document_value
+        )
 
     task_logger.info("Updated %d users", updated_count)
 
@@ -53,7 +55,8 @@ def set_user_search_document_values(updated_count: int = 0) -> None:
 @app.task
 def set_order_search_document_values(updated_count: int = 0) -> None:
     orders = list(
-        Order.objects.filter(search_vector=None)
+        Order.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(search_vector=None)
         .prefetch_related(
             "user",
             "billing_address",
@@ -62,14 +65,17 @@ def set_order_search_document_values(updated_count: int = 0) -> None:
             "discounts",
             "lines",
         )
-        .order_by()[:BATCH_SIZE]
+        .order_by("-number")[:BATCH_SIZE]
     )
 
     if not orders:
         task_logger.info("No orders to update.")
         return
 
-    updated_count += set_search_vector_values(orders, prepare_order_search_vector_value)
+    with allow_writer():
+        updated_count += set_search_vector_values(
+            orders, prepare_order_search_vector_value
+        )
 
     task_logger.info("Updated %d orders", updated_count)
 
@@ -85,19 +91,21 @@ def set_order_search_document_values(updated_count: int = 0) -> None:
 @app.task
 def set_product_search_document_values(updated_count: int = 0) -> None:
     products = list(
-        Product.objects.filter(search_vector=None)
+        Product.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(search_vector=None)
         .prefetch_related(*PRODUCT_FIELDS_TO_PREFETCH)
-        .order_by()[:BATCH_SIZE]
+        .order_by("-id")[:BATCH_SIZE]
     )
 
     if not products:
         task_logger.info("No products to update.")
         return
 
-    updated_count += set_search_vector_values(
-        products,
-        prepare_product_search_vector_value,
-    )
+    with allow_writer():
+        updated_count += set_search_vector_values(
+            products,
+            prepare_product_search_vector_value,
+        )
 
     task_logger.info("Updated %d products", updated_count)
 
@@ -110,7 +118,7 @@ def set_product_search_document_values(updated_count: int = 0) -> None:
     set_product_search_document_values.delay(updated_count)
 
 
-def set_search_document_values(instances: List, prepare_search_document_func):
+def set_search_document_values(instances: list, prepare_search_document_func):
     if not instances:
         return 0
     Model = instances[0]._meta.model

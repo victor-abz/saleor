@@ -1,7 +1,7 @@
 import copy
 import logging
 import time
-from typing import List, NamedTuple
+from typing import Any, NamedTuple
 
 import celery.beat
 import celery.schedules
@@ -26,7 +26,7 @@ def setup_celery_logging(loglevel=None, **_kwargs):
 
 
 def is_numeric_value(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, int | float) and not isinstance(value, bool)
 
 
 class HeapEventType(NamedTuple):
@@ -60,6 +60,8 @@ class CustomModelEntry(ModelEntry):
 class BaseScheduler(celery.beat.Scheduler):
     """Define the base scheduler for Celery beat."""
 
+    old_schedulers: Any | None
+
     def tick(
         self,
         # Parameters are not used but required by invoker
@@ -90,8 +92,7 @@ class BaseScheduler(celery.beat.Scheduler):
             self.old_schedulers = copy.copy(self.schedule)
             self.populate_heap()
 
-        H: List[HeapEventType] = self._heap
-
+        H: list[HeapEventType] | None = self._heap
         if not H:
             return max_interval
 

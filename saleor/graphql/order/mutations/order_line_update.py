@@ -2,7 +2,6 @@ import graphene
 from django.core.exceptions import ValidationError
 
 from ....core.exceptions import InsufficientStock
-from ....core.permissions import OrderPermissions
 from ....core.tracing import traced_atomic_transaction
 from ....order import models
 from ....order.error_codes import OrderErrorCode
@@ -12,16 +11,21 @@ from ....order.utils import (
     invalidate_order_prices,
     recalculate_order_weight,
 )
-from ...app.dataloaders import load_app
-from ...core.mutations import ModelMutation
+from ....permission.enums import OrderPermissions
+from ...app.dataloaders import get_app_promise
+from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
+from ...core.mutations import ModelWithRestrictedChannelAccessMutation
 from ...core.types import OrderError
-from ...plugins.dataloaders import load_plugin_manager
+from ...plugins.dataloaders import get_plugin_manager_promise
 from ..types import Order, OrderLine
 from .draft_order_create import OrderLineInput
-from .utils import EditableOrderValidationMixin, get_webhook_handler_by_order_status
+from .utils import EditableOrderValidationMixin, call_event_by_order_status
 
 
-class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
+class OrderLineUpdate(
+    EditableOrderValidationMixin, ModelWithRestrictedChannelAccessMutation
+):
     order = graphene.Field(Order, description="Related order.")
 
     class Arguments:
@@ -39,9 +43,9 @@ class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
         error_type_field = "order_errors"
 
     @classmethod
-    def clean_input(cls, info, instance, data):
+    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
         instance.old_quantity = instance.quantity
-        cleaned_input = super().clean_input(info, instance, data)
+        cleaned_input = super().clean_input(info, instance, data, **kwargs)
         cls.validate_order(instance.order)
 
         quantity = data["quantity"]
@@ -50,21 +54,33 @@ class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
                 {
                     "quantity": ValidationError(
                         "Ensure this value is greater than 0.",
-                        code=OrderErrorCode.ZERO_QUANTITY,
+                        code=OrderErrorCode.ZERO_QUANTITY.value,
                     )
                 }
             )
+        if instance.is_gift:
+            raise ValidationError(
+                {
+                    "id": ValidationError(
+                        "Order line marked as gift can't be edited.",
+                        code=OrderErrorCode.NON_EDITABLE_GIFT_LINE.value,
+                    )
+                }
+            )
+
         return cleaned_input
 
     @classmethod
-    def save(cls, info, instance, cleaned_input):
-        manager = load_plugin_manager(info.context)
+    def save(cls, info: ResolveInfo, instance, cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+
+        line_allocation = instance.allocations.first()
         warehouse_pk = (
-            instance.allocations.first().stock.warehouse.pk
-            if instance.order.is_unconfirmed()
+            line_allocation.stock.warehouse.pk
+            if line_allocation and instance.order.is_unconfirmed()
             else None
         )
-        app = load_app(info.context)
+        app = get_app_promise(info.context).get()
         with traced_atomic_transaction():
             line_info = OrderLineInfo(
                 line=instance,
@@ -72,6 +88,7 @@ class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
                 variant=instance.variant,
                 warehouse_pk=warehouse_pk,
             )
+            order = instance.order
             try:
                 change_order_line_quantity(
                     info.context.user,
@@ -79,23 +96,29 @@ class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
                     line_info,
                     instance.old_quantity,
                     instance.quantity,
-                    instance.order.channel,
+                    order,
                     manager,
                 )
-            except InsufficientStock:
+            except InsufficientStock as e:
                 raise ValidationError(
                     "Cannot set new quantity because of insufficient stock.",
-                    code=OrderErrorCode.INSUFFICIENT_STOCK,
-                )
-            invalidate_order_prices(instance.order)
-            recalculate_order_weight(instance.order)
-            instance.order.save(update_fields=["should_refresh_prices", "weight"])
+                    code=OrderErrorCode.INSUFFICIENT_STOCK.value,
+                ) from e
+            invalidate_order_prices(order)
+            recalculate_order_weight(order)
+            order.save(update_fields=["should_refresh_prices", "weight"])
 
-            func = get_webhook_handler_by_order_status(instance.order.status, manager)
-            cls.call_event(func, instance.order)
+            call_event_by_order_status(order, manager)
 
     @classmethod
     def success_response(cls, instance):
-        response = super().success_response(instance)
-        response.order = instance.order
-        return response
+        return cls(
+            orderLine=SyncWebhookControlContext(node=instance),
+            order=SyncWebhookControlContext(node=instance.order),
+            errors=[],
+        )
+
+    @classmethod
+    def get_instance_channel_id(cls, instance, **data):
+        """Retrieve the instance channel id for channel permission accessible check."""
+        return instance.order.channel_id

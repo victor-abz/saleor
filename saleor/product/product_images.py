@@ -14,14 +14,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def get_product_image_thumbnail_url(product_media: Optional["ProductMedia"], size: int):
+def get_product_image_thumbnail_url(
+    product_media: Optional["ProductMedia"], size: int
+) -> str:
     """Return product media image thumbnail or placeholder if there is no image."""
     size = get_thumbnail_size(size)
     if not product_media or not product_media.image:
         return get_product_image_placeholder(size)
     thumbnail = Thumbnail.objects.filter(size=size, product_media=product_media).first()
     return get_image_or_proxy_url(
-        thumbnail, product_media.id, "ProductMedia", size, None
+        thumbnail, str(product_media.id), "ProductMedia", size, None
     )
 
 

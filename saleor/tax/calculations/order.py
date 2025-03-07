@@ -1,16 +1,15 @@
+from collections.abc import Iterable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Iterable, Tuple
+from typing import TYPE_CHECKING
 
-from prices import Money, TaxedMoney
+from django.conf import settings
+from prices import TaxedMoney
 
+from ...core.db.connection import allow_writer
 from ...core.prices import quantize_price
-from ...core.taxes import zero_money, zero_taxed_money
-from ...discount import OrderDiscountType
+from ...core.taxes import zero_taxed_money
 from ...order import base_calculations
-from ...order.utils import (
-    get_order_country,
-    get_total_order_discount_excluding_shipping,
-)
+from ...order.utils import get_order_country
 from ..models import TaxClassCountryRate
 from ..utils import (
     denormalize_tax_rate_from_db,
@@ -27,34 +26,46 @@ def update_order_prices_with_flat_rates(
     order: "Order",
     lines: Iterable["OrderLine"],
     prices_entered_with_tax: bool,
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
 ):
     country_code = get_order_country(order)
-    default_country_rate_obj = TaxClassCountryRate.objects.filter(
-        country=country_code, tax_class=None
-    ).first()
+    default_country_rate_obj = (
+        TaxClassCountryRate.objects.using(database_connection_name)
+        .filter(country=country_code, tax_class=None)
+        .first()
+    )
     default_tax_rate = (
         default_country_rate_obj.rate if default_country_rate_obj else Decimal(0)
     )
 
-    # Calculate order line totals.
+    # Calculate order line taxes.
     _, undiscounted_subtotal = update_taxes_for_order_lines(
         order, lines, country_code, default_tax_rate, prices_entered_with_tax
     )
 
     # Calculate order shipping.
-    shipping_method = order.shipping_method
-    shipping_tax_class = getattr(shipping_method, "tax_class", None)
+    with allow_writer():
+        # allow writer as this action directly fetches the shipping method from the
+        # writer. Will be solved by the task:
+        # https://linear.app/saleor/issue/EXT-1990/update-order-prices-with-flat-rates-
+        # makes-db-writer-to-get-shipping
+        shipping_method = order.shipping_method
+        shipping_tax_class = getattr(shipping_method, "tax_class", None)
+
     if shipping_tax_class:
         shipping_tax_rate = get_tax_rate_for_tax_class(
             shipping_tax_class,
-            shipping_tax_class.country_rates.all(),
+            shipping_tax_class.country_rates.using(database_connection_name).all(),
             default_tax_rate,
             country_code,
         )
-    elif order.shipping_tax_rate is not None:
-        # Use order.shipping_tax_rate if it was ever set before (it's non-null now).
-        # This is a valid case when recalculating shipping price and the tax class is
-        # null, because it was removed from the system.
+    elif (
+        order.shipping_tax_class_name is not None
+        and order.shipping_tax_rate is not None
+    ):
+        # Use order.shipping_tax_rate if it was ever set before (it's non-null now and
+        # the name is non-null). This is a valid case when recalculating shipping price
+        # and the tax class is null, because it was removed from the system.
         shipping_tax_rate = denormalize_tax_rate_from_db(order.shipping_tax_rate)
     else:
         shipping_tax_rate = default_tax_rate
@@ -64,40 +75,59 @@ def update_order_prices_with_flat_rates(
     )
     order.shipping_tax_rate = normalize_tax_rate_for_db(shipping_tax_rate)
 
-    # Calculate order total.
-    order.undiscounted_total = undiscounted_subtotal + order.base_shipping_price
-    order.total = _calculate_order_total(order, lines)
+    _set_order_totals(
+        order,
+        lines,
+        prices_entered_with_tax,
+        database_connection_name=database_connection_name,
+    )
 
 
-def _calculate_order_total(
+def _set_order_totals(
     order: "Order",
     lines: Iterable["OrderLine"],
-) -> TaxedMoney:
+    prices_entered_with_tax: bool,
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
+):
     currency = order.currency
 
-    default_value = base_calculations.base_order_total(order, lines)
+    default_value = base_calculations.base_order_total(
+        order, lines, database_connection_name=database_connection_name
+    )
     default_value = TaxedMoney(default_value, default_value)
     if default_value <= zero_taxed_money(currency):
-        return quantize_price(default_value, currency)
+        order.total = quantize_price(default_value, currency)
+        order.undiscounted_total = quantize_price(default_value, currency)
+        order.subtotal = quantize_price(default_value, currency)
+        return
 
-    total = zero_taxed_money(currency)
+    subtotal = zero_taxed_money(currency)
     undiscounted_subtotal = zero_taxed_money(currency)
     for line in lines:
-        total += line.total_price
+        subtotal += line.total_price
         undiscounted_subtotal += line.undiscounted_total_price
-    total += order.shipping_price
 
-    order_discount = order.discounts.filter(type=OrderDiscountType.MANUAL).first()
-    if order_discount and order_discount.amount > undiscounted_subtotal.gross:
-        remaining_amount = order_discount.amount - undiscounted_subtotal.gross
-        total -= remaining_amount
-    return quantize_price(max(total, zero_taxed_money(currency)), currency)
+    shipping_tax_rate = order.shipping_tax_rate or 0
+    undiscounted_shipping_price = calculate_flat_rate_tax(
+        order.undiscounted_base_shipping_price,
+        Decimal(shipping_tax_rate * 100),
+        prices_entered_with_tax,
+    )
+    undiscounted_total = undiscounted_subtotal + undiscounted_shipping_price
+
+    order.total = quantize_price(subtotal + order.shipping_price, currency)
+    order.undiscounted_total = quantize_price(undiscounted_total, currency)
+    order.subtotal = quantize_price(subtotal, currency)
 
 
 def _calculate_order_shipping(
     order: "Order", tax_rate: Decimal, prices_entered_with_tax: bool
 ) -> TaxedMoney:
-    shipping_price = order.base_shipping_price
+    shipping_price = (
+        order.shipping_price_gross
+        if prices_entered_with_tax
+        else order.shipping_price_net
+    )
     taxed_shipping_price = calculate_flat_rate_tax(
         shipping_price, tax_rate, prices_entered_with_tax
     )
@@ -110,15 +140,9 @@ def update_taxes_for_order_lines(
     country_code: str,
     default_tax_rate: Decimal,
     prices_entered_with_tax: bool,
-) -> Tuple[Iterable["OrderLine"], TaxedMoney]:
+) -> tuple[Iterable["OrderLine"], TaxedMoney]:
     currency = order.currency
     lines = list(lines)
-
-    total_discount_amount = get_total_order_discount_excluding_shipping(order).amount
-    order_total_price = sum(
-        [line.base_unit_price.amount * line.quantity for line in lines]
-    )
-    total_line_discounts = 0
 
     undiscounted_subtotal = zero_taxed_money(order.currency)
 
@@ -135,40 +159,19 @@ def update_taxes_for_order_lines(
                 default_tax_rate,
                 country_code,
             )
-        elif line.tax_rate is not None:
-            # line.tax_class can be None when the tax class was removed from DB. In
-            # this case try to use line.tax_rate which stores the denormalized tax rate
-            # value that was originally used.
+        elif line.tax_class_name is not None and line.tax_rate is not None:
+            # If tax_class is None but tax_class_name is set, the tax class was set
+            # for this line before, but is now removed from the system. In this case
+            # try to use line.tax_rate which stores the denormalized tax rate value
+            # that was originally provided by the tax class.
             tax_rate = denormalize_tax_rate_from_db(line.tax_rate)
         else:
             tax_rate = default_tax_rate
 
-        line_total_price = line.base_unit_price * line.quantity
-        undiscounted_subtotal += line_total_price
-
-        price_with_discounts = line.base_unit_price
-        if total_discount_amount:
-            if line is lines[-1]:
-                # for the last line applied remaining discount
-                discount_amount = total_discount_amount - total_line_discounts
-            else:
-                # calculate discount proportionally to the rate of total line price
-                # to order total price.
-                discount_amount = quantize_price(
-                    line_total_price.amount / order_total_price * total_discount_amount,
-                    currency,
-                )
-            price_with_discounts = max(
-                quantize_price(
-                    (line_total_price - Money(discount_amount, currency))
-                    / line.quantity,
-                    currency,
-                ),
-                zero_money(currency),
-            )
-            # sum already applied discounts
-            total_line_discounts += discount_amount
-
+        undiscounted_subtotal += line.undiscounted_base_unit_price * line.quantity
+        price_with_discounts = (
+            line.unit_price.gross if prices_entered_with_tax else line.unit_price.net
+        )
         unit_price = calculate_flat_rate_tax(
             price_with_discounts, tax_rate, prices_entered_with_tax
         )

@@ -1,45 +1,9 @@
 from unittest import mock
 
 import graphene
-import pytest
 
-from .....discount.models import Voucher, VoucherChannelListing
+from .....discount.models import Voucher
 from ....tests.utils import get_graphql_content
-
-
-@pytest.fixture
-def voucher_list(channel_USD):
-    [voucher_1, voucher_2, voucher_3] = Voucher.objects.bulk_create(
-        [
-            Voucher(code="voucher-1"),
-            Voucher(code="voucher-2"),
-            Voucher(code="voucher-3"),
-        ]
-    )
-    VoucherChannelListing.objects.bulk_create(
-        [
-            VoucherChannelListing(
-                voucher=voucher_1,
-                channel=channel_USD,
-                discount_value=1,
-                currency=channel_USD.currency_code,
-            ),
-            VoucherChannelListing(
-                voucher=voucher_2,
-                channel=channel_USD,
-                discount_value=2,
-                currency=channel_USD.currency_code,
-            ),
-            VoucherChannelListing(
-                voucher=voucher_3,
-                channel=channel_USD,
-                discount_value=3,
-                currency=channel_USD.currency_code,
-            ),
-        ]
-    )
-    return voucher_1, voucher_2, voucher_3
-
 
 BULK_DELETE_VOUCHERS_MUTATION = """
     mutation voucherBulkDelete($ids: [ID!]!) {
@@ -70,7 +34,7 @@ def test_delete_vouchers(staff_api_client, voucher_list, permission_manage_disco
     ).exists()
 
 
-@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.graphql.discount.mutations.bulk_mutations.get_webhooks_for_event")
 @mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_delete_vouchers_trigger_webhook(
     mocked_webhook_trigger,

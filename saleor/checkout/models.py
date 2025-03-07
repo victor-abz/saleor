@@ -1,8 +1,9 @@
 """Checkout-related ORM models."""
-from datetime import date
+
+import datetime
 from decimal import Decimal
 from operator import attrgetter
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Optional
 from uuid import uuid4
 
 from django.conf import settings
@@ -16,29 +17,33 @@ from prices import Money
 
 from ..channel.models import Channel
 from ..core.models import ModelWithMetadata
-from ..core.permissions import CheckoutPermissions
 from ..core.taxes import zero_money
-from ..core.weight import zero_weight
 from ..giftcard.models import GiftCard
+from ..permission.enums import CheckoutPermissions
 from ..shipping.models import ShippingMethod
+from . import CheckoutAuthorizeStatus, CheckoutChargeStatus
 
 if TYPE_CHECKING:
-    from django_measurement import Weight
-
     from ..payment.models import Payment
     from ..product.models import ProductVariant
-    from .fetch import CheckoutLineInfo
 
 
 def get_default_country():
     return settings.DEFAULT_COUNTRY
 
 
-class Checkout(ModelWithMetadata):
+class Checkout(models.Model):
     """A shopping checkout."""
 
     created_at = models.DateTimeField(auto_now_add=True)
-    last_change = models.DateTimeField(auto_now=True)
+    last_change = models.DateTimeField(auto_now=True, db_index=True)
+    completing_started_at = models.DateTimeField(blank=True, null=True)
+
+    # Denormalized modified_at for the latest modified transactionItem assigned to
+    # checkout
+    last_transaction_modified_at = models.DateTimeField(null=True, blank=True)
+    automatically_refundable = models.BooleanField(default=False)
+
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         blank=True,
@@ -53,6 +58,7 @@ class Checkout(ModelWithMetadata):
         related_name="checkouts",
         on_delete=models.PROTECT,
     )
+    save_billing_address = models.BooleanField(default=True)
     billing_address = models.ForeignKey(
         "account.Address",
         related_name="+",
@@ -60,6 +66,8 @@ class Checkout(ModelWithMetadata):
         null=True,
         on_delete=models.SET_NULL,
     )
+    # do not apply on checkouts with collection point
+    save_shipping_address = models.BooleanField(default=True)
     shipping_address = models.ForeignKey(
         "account.Address",
         related_name="+",
@@ -74,6 +82,14 @@ class Checkout(ModelWithMetadata):
         related_name="checkouts",
         on_delete=models.SET_NULL,
     )
+
+    shipping_method_name = models.CharField(
+        max_length=255, null=True, default=None, blank=True, editable=False
+    )
+    external_shipping_method_id = models.CharField(
+        max_length=512, null=True, default=None, blank=True, editable=False
+    )
+
     collection_point = models.ForeignKey(
         "warehouse.Warehouse",
         blank=True,
@@ -102,6 +118,13 @@ class Checkout(ModelWithMetadata):
         net_amount_field="total_net_amount",
         gross_amount_field="total_gross_amount",
     )
+    # base price contains only catalogue discounts (does not contains voucher discount)
+    base_total_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal(0),
+    )
+    base_total = MoneyField(amount_field="base_total_amount", currency_field="currency")
 
     subtotal_net_amount = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
@@ -116,6 +139,15 @@ class Checkout(ModelWithMetadata):
     subtotal = TaxedMoneyField(
         net_amount_field="subtotal_net_amount",
         gross_amount_field="subtotal_gross_amount",
+    )
+    # base price contains only catalogue discounts (does not contains voucher discount)
+    base_subtotal_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal(0),
+    )
+    base_subtotal = MoneyField(
+        amount_field="base_subtotal_amount", currency_field="currency"
     )
 
     shipping_price_net_amount = models.DecimalField(
@@ -136,6 +168,31 @@ class Checkout(ModelWithMetadata):
         max_digits=5, decimal_places=4, default=Decimal("0.0")
     )
 
+    undiscounted_base_shipping_price_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal(0),
+    )
+    # Shipping price before applying any discounts
+    undiscounted_base_shipping_price = MoneyField(
+        amount_field="undiscounted_base_shipping_price_amount",
+        currency_field="currency",
+    )
+
+    authorize_status = models.CharField(
+        max_length=32,
+        default=CheckoutAuthorizeStatus.NONE,
+        choices=CheckoutAuthorizeStatus.CHOICES,
+        db_index=True,
+    )
+
+    charge_status = models.CharField(
+        max_length=32,
+        default=CheckoutChargeStatus.NONE,
+        choices=CheckoutChargeStatus.CHOICES,
+        db_index=True,
+    )
+
     price_expiration = models.DateTimeField(default=timezone.now)
 
     discount_amount = models.DecimalField(
@@ -147,8 +204,13 @@ class Checkout(ModelWithMetadata):
     discount_name = models.CharField(max_length=255, blank=True, null=True)
 
     translated_discount_name = models.CharField(max_length=255, blank=True, null=True)
-    voucher_code = models.CharField(max_length=255, blank=True, null=True)
     gift_cards = models.ManyToManyField(GiftCard, blank=True, related_name="checkouts")
+    voucher_code = models.CharField(max_length=255, blank=True, null=True)
+
+    # The field prevents race condition when two different threads are processing
+    # the same checkout with limited usage voucher assigned. Both threads increasing the
+    # voucher usage would cause `NotApplicable` error for voucher.
+    is_voucher_usage_increased = models.BooleanField(default=False)
 
     redirect_url = models.URLField(blank=True, null=True)
     tracking_code = models.CharField(max_length=255, blank=True, null=True)
@@ -158,8 +220,9 @@ class Checkout(ModelWithMetadata):
     )
 
     tax_exemption = models.BooleanField(default=False)
+    tax_error = models.CharField(max_length=255, blank=True, null=True)
 
-    class Meta(ModelWithMetadata.Meta):
+    class Meta:
         ordering = ("-last_change", "pk")
         permissions = (
             (CheckoutPermissions.MANAGE_CHECKOUTS.codename, "Manage checkouts"),
@@ -171,28 +234,36 @@ class Checkout(ModelWithMetadata):
     def __iter__(self):
         return iter(self.lines.all())
 
-    def get_customer_email(self) -> Optional[str]:
+    def get_customer_email(self) -> str | None:
         return self.user.email if self.user else self.email
 
     def is_shipping_required(self) -> bool:
         """Return `True` if any of the lines requires shipping."""
         return any(line.is_shipping_required() for line in self)
 
-    def get_total_gift_cards_balance(self) -> Money:
+    def is_checkout_locked(self) -> bool:
+        return bool(
+            self.completing_started_at
+            and (
+                (timezone.now() - self.completing_started_at).seconds
+                < settings.CHECKOUT_COMPLETION_LOCK_TIME
+            )
+        )
+
+    def get_total_gift_cards_balance(
+        self, database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME
+    ) -> Money:
         """Return the total balance of the gift cards assigned to the checkout."""
-        balance = self.gift_cards.active(date=date.today()).aggregate(  # type: ignore
-            models.Sum("current_balance_amount")
-        )["current_balance_amount__sum"]
+        balance = (
+            self.gift_cards.using(database_connection_name)
+            .active(date=datetime.datetime.now(tz=datetime.UTC).date())
+            .aggregate(models.Sum("current_balance_amount"))[
+                "current_balance_amount__sum"
+            ]
+        )
         if balance is None:
             return zero_money(currency=self.currency)
         return Money(balance, self.currency)
-
-    def get_total_weight(self, lines: Iterable["CheckoutLineInfo"]) -> "Weight":
-        weights = zero_weight()
-        for checkout_line_info in lines:
-            line = checkout_line_info.line
-            weights += line.variant.get_weight() * line.quantity
-        return weights
 
     def get_line(self, variant: "ProductVariant") -> Optional["CheckoutLine"]:
         """Return a line matching the given variant and data if any."""
@@ -242,6 +313,7 @@ class CheckoutLine(ModelWithMetadata):
         "product.ProductVariant", related_name="+", on_delete=models.CASCADE
     )
     quantity = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    is_gift = models.BooleanField(default=False)
     price_override = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
@@ -250,6 +322,28 @@ class CheckoutLine(ModelWithMetadata):
     )
     currency = models.CharField(
         max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH,
+    )
+
+    undiscounted_unit_price_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        default=Decimal(0),
+    )
+
+    undiscounted_unit_price = MoneyField(
+        amount_field="undiscounted_unit_price_amount",
+        currency_field="currency",
+    )
+
+    prior_unit_price_amount = models.DecimalField(
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        blank=True,
+        null=True,
+    )
+
+    prior_unit_price = MoneyField(
+        amount_field="prior_unit_price_amount", currency_field="currency"
     )
 
     total_price_net_amount = models.DecimalField(
@@ -288,7 +382,7 @@ class CheckoutLine(ModelWithMetadata):
         return not self == other  # pragma: no cover
 
     def __repr__(self):
-        return "CheckoutLine(variant=%r, quantity=%r)" % (self.variant, self.quantity)
+        return f"CheckoutLine(variant={self.variant!r}, quantity={self.quantity!r})"
 
     def __getstate__(self):
         return self.variant, self.quantity
@@ -299,3 +393,11 @@ class CheckoutLine(ModelWithMetadata):
     def is_shipping_required(self) -> bool:
         """Return `True` if the related product variant requires shipping."""
         return self.variant.is_shipping_required()
+
+
+# Checkout metadata is moved to separate model so it can be used when checkout model is
+# locked by select_for_update during complete_checkout.
+class CheckoutMetadata(ModelWithMetadata):
+    checkout = models.OneToOneField(
+        Checkout, related_name="metadata_storage", on_delete=models.CASCADE
+    )

@@ -1,20 +1,21 @@
+import datetime
 import functools
 import logging
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from functools import partial
 from time import monotonic
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 from asgiref.local import Local
 from django.conf import settings
-from django.contrib.sites.models import Site
 from django.core.cache import cache
 from django.utils import timezone
 from graphql import GraphQLDocument
 from pytimeparse import parse
 
+from ...core.utils import get_domain
 from ..event_types import WebhookEventAsyncType
 from ..utils import get_webhooks_for_event
 from .buffers import get_buffer
@@ -23,7 +24,6 @@ from .payloads import generate_api_call_payload, generate_event_delivery_attempt
 from .tracing import opentracing_trace
 
 if TYPE_CHECKING:
-
     from celery.exceptions import Retry
     from django.http import HttpRequest, HttpResponse
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 CACHE_TIMEOUT = parse("2 minutes")
 BUFFER_KEY = "observability_buffer"
 WEBHOOKS_KEY = "observability_webhooks"
-_active_webhooks_exists_cache: Dict[str, Tuple[bool, float]] = {}
+_active_webhooks_exists_cache: dict[str, tuple[bool, float]] = {}
 _context = Local()
 
 
@@ -42,21 +42,21 @@ class WebhookData:
     id: int
     saleor_domain: str
     target_url: str
-    secret_key: Optional[str] = None
+    secret_key: str | None = None
 
 
 def get_buffer_name() -> str:
-    return cache.make_key(BUFFER_KEY)
+    return cache.make_key(BUFFER_KEY, version=2)
 
 
-_webhooks_mem_cache: Dict[str, Tuple[List[WebhookData], float]] = {}
+_webhooks_mem_cache: dict[str, tuple[list[WebhookData], float]] = {}
 
 
 def get_webhooks_clear_mem_cache():
     _webhooks_mem_cache.clear()
 
 
-def get_webhooks(timeout=CACHE_TIMEOUT) -> List[WebhookData]:
+def get_webhooks(timeout=CACHE_TIMEOUT) -> list[WebhookData]:
     with opentracing_trace("get_observability_webhooks", "webhooks"):
         buffer_name = get_buffer_name()
         if cached := _webhooks_mem_cache.get(buffer_name, None):
@@ -67,7 +67,7 @@ def get_webhooks(timeout=CACHE_TIMEOUT) -> List[WebhookData]:
         if webhooks_data is None:
             webhooks_data = []
             if webhooks := get_webhooks_for_event(WebhookEventAsyncType.OBSERVABILITY):
-                domain = Site.objects.get_current().domain
+                domain = get_domain()
                 for webhook in webhooks:
                     webhooks_data.append(
                         WebhookData(
@@ -82,15 +82,15 @@ def get_webhooks(timeout=CACHE_TIMEOUT) -> List[WebhookData]:
         return webhooks_data
 
 
-def task_next_retry_date(retry_error: "Retry") -> Optional[datetime]:
-    if isinstance(retry_error.when, (int, float)):
-        return timezone.now() + timedelta(seconds=retry_error.when)
-    if isinstance(retry_error.when, datetime):
+def task_next_retry_date(retry_error: "Retry") -> datetime.datetime | None:
+    if isinstance(retry_error.when, int | float):
+        return timezone.now() + datetime.timedelta(seconds=retry_error.when)
+    if isinstance(retry_error.when, datetime.datetime):
         return retry_error.when
     return None
 
 
-def put_event(generate_payload: Callable[[], Any]):
+def put_event(generate_payload: Callable[[], bytes]):
     try:
         payload = generate_payload()
         with opentracing_trace("put_event", "buffer"):
@@ -99,34 +99,34 @@ def put_event(generate_payload: Callable[[], Any]):
     except TruncationError as err:
         logger.warning("Observability event dropped. %s", err, extra=err.extra)
     except Exception:
-        logger.error("Observability event dropped.", exc_info=True)
+        logger.exception("Observability event dropped.")
 
 
-def pop_events_with_remaining_size() -> Tuple[List[Any], int]:
+def pop_events_with_remaining_size() -> tuple[list[bytes], int]:
     with opentracing_trace("pop_events", "buffer"):
         try:
             buffer = get_buffer(get_buffer_name())
             events, remaining = buffer.pop_events_get_size()
             batch_count = buffer.in_batches(remaining)
         except Exception:
-            logger.error("Could not pop observability events batch.", exc_info=True)
+            logger.exception("Could not pop observability events batch.")
             events, batch_count = [], 0
     return events, batch_count
 
 
 @dataclass
 class GraphQLOperationResponse:
-    name: Optional[str] = None
-    query: Optional[GraphQLDocument] = None
-    variables: Optional[Dict] = None
-    result: Optional[Dict] = None
+    name: str | None = None
+    query: GraphQLDocument | None = None
+    variables: dict | None = None
+    result: dict | None = None
     result_invalid: bool = False
 
 
 class ApiCall:
     def __init__(self, request: "HttpRequest"):
-        self.gql_operations: List[GraphQLOperationResponse] = []
-        self.response: Optional["HttpResponse"] = None
+        self.gql_operations: list[GraphQLOperationResponse] = []
+        self.response: HttpResponse | None = None
         self._reported = False
         self.request = request
 
@@ -188,7 +188,7 @@ def report_view(method):
 
 
 def report_event_delivery_attempt(
-    attempt: "EventDeliveryAttempt", next_retry: Optional["datetime"] = None
+    attempt: "EventDeliveryAttempt", next_retry: datetime.datetime | None = None
 ):
     if not settings.OBSERVABILITY_ACTIVE:
         return

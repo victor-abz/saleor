@@ -1,4 +1,4 @@
-from typing import Dict, List, Mapping, Union
+from collections.abc import Mapping
 
 import graphene
 from django.core.exceptions import ValidationError
@@ -21,16 +21,16 @@ class BaseExportMutation(BaseMutation):
         abstract = True
 
     @classmethod
-    def get_scope(cls, input, only_type) -> Mapping[str, Union[list, dict, str]]:
+    def get_scope(cls, input, only_type) -> Mapping[str, list | dict | str]:
         scope = input["scope"]
-        if scope == ExportScope.IDS.value:  # type: ignore
+        if scope == ExportScope.IDS.value:  # type: ignore[attr-defined] # mypy does not understand graphene enums # noqa: E501
             return cls.clean_ids(input, only_type)
-        elif scope == ExportScope.FILTER.value:  # type: ignore
+        if scope == ExportScope.FILTER.value:  # type: ignore[attr-defined] # mypy does not understand graphene enums # noqa: E501
             return cls.clean_filter(input)
         return {"all": ""}
 
     @classmethod
-    def clean_ids(cls, input, only_type) -> Dict[str, List[str]]:
+    def clean_ids(cls, input, only_type) -> dict[str, list[str]]:
         ids = input.get("ids", [])
         if not ids:
             raise ValidationError(
@@ -45,7 +45,7 @@ class BaseExportMutation(BaseMutation):
         return {"ids": pks}
 
     @staticmethod
-    def clean_filter(input) -> Dict[str, dict]:
+    def clean_filter(input) -> dict[str, dict]:
         filter = input.get("filter")
         if not filter:
             raise ValidationError(

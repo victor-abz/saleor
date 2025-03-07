@@ -3,25 +3,30 @@ from django.core.exceptions import ValidationError
 
 from ....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from ....checkout.models import Checkout
-from ....checkout.utils import invalidate_checkout_prices
-from ....core.permissions import CheckoutPermissions
+from ....checkout.utils import invalidate_checkout
 from ....graphql.core.mutations import BaseMutation
 from ....order import ORDER_EDITABLE_STATUS
 from ....order.models import Order
+from ....permission.enums import CheckoutPermissions
 from ....tax import error_codes
-from ...core.descriptions import ADDED_IN_38, PREVIEW_FEATURE
+from ...core import ResolveInfo
+from ...core.context import SyncWebhookControlContext
+from ...core.doc_category import DOC_CATEGORY_TAXES
 from ...core.types import Error
 from ...core.types.taxes import TaxSourceObject
-from ...discount.dataloaders import load_discounts
-from ...plugins.dataloaders import load_plugin_manager
+from ...plugins.dataloaders import get_plugin_manager_promise
 
 TaxExemptionManageErrorCode = graphene.Enum.from_enum(
     error_codes.TaxExemptionManageErrorCode
 )
+TaxExemptionManageErrorCode.doc_category = DOC_CATEGORY_TAXES
 
 
 class TaxExemptionManageError(Error):
     code = TaxExemptionManageErrorCode(description="The error code.", required=True)
+
+    class Meta:
+        doc_category = DOC_CATEGORY_TAXES
 
 
 class TaxExemptionManage(BaseMutation):
@@ -41,16 +46,15 @@ class TaxExemptionManage(BaseMutation):
             "enabled, taxes won't be charged for the checkout or order. Taxes may "
             "still be calculated in cases when product prices are entered with the "
             "tax included and the net price needs to be known."
-            + ADDED_IN_38
-            + PREVIEW_FEATURE
         )
+        doc_category = DOC_CATEGORY_TAXES
         error_type_class = TaxExemptionManageError
         permissions = (CheckoutPermissions.MANAGE_TAXES,)
 
     @classmethod
-    def validate_input(cls, info, data):
+    def validate_input(cls, info: ResolveInfo, data):
         obj = cls.get_node_or_error(info, data["id"])
-        if not isinstance(obj, (Order, Checkout)):
+        if not isinstance(obj, Order | Checkout):
             code = error_codes.TaxExemptionManageErrorCode.NOT_FOUND.value
             message = "Invalid object ID. Only Checkout and Order ID's are accepted."
             raise ValidationError({"id": ValidationError(code=code, message=message)})
@@ -66,33 +70,31 @@ class TaxExemptionManage(BaseMutation):
             raise ValidationError(code=code, message=message)
 
     @classmethod
-    def get_object(cls, info, object_global_id):
+    def get_object(cls, info: ResolveInfo, object_global_id):
         obj = graphene.Node.get_node_from_global_id(info, object_global_id)
         return obj
 
     @classmethod
-    def _invalidate_checkout_prices(cls, info, checkout):
-        manager = load_plugin_manager(info.context)
-        discounts = load_discounts(info.context)
+    def _invalidate_checkout(cls, info: ResolveInfo, checkout):
+        manager = get_plugin_manager_promise(info.context).get()
 
-        checkout_info = fetch_checkout_info(checkout, [], discounts, manager)
+        checkout_info = fetch_checkout_info(checkout, [], manager)
         lines_info, _ = fetch_checkout_lines(checkout)
-        invalidate_checkout_prices(
+        invalidate_checkout(
             checkout_info,
             lines_info,
             manager,
-            discounts,
             save=False,
         )
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         cls.validate_input(info, data)
         obj = cls.get_object(info, data["id"])
         obj.tax_exemption = data["tax_exemption"]
 
         if isinstance(obj, Checkout):
-            cls._invalidate_checkout_prices(info, obj)
+            cls._invalidate_checkout(info, obj)
             obj.save(update_fields=["tax_exemption", "price_expiration", "last_change"])
 
         if isinstance(obj, Order):
@@ -102,4 +104,4 @@ class TaxExemptionManage(BaseMutation):
                 update_fields=["tax_exemption", "should_refresh_prices", "updated_at"]
             )
 
-        return TaxExemptionManage(taxable_object=obj)
+        return TaxExemptionManage(taxable_object=SyncWebhookControlContext(node=obj))

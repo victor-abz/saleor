@@ -73,8 +73,7 @@ def test_product_type_delete_with_file_attributes(
     product_type.product_attributes.add(file_attribute)
     associate_attribute_values_to_instance(
         product_with_variant_with_file_attribute,
-        file_attribute,
-        file_attribute.values.last(),
+        {file_attribute.pk: [file_attribute.values.last()]},
     )
     values = list(file_attribute.values.all())
 
@@ -114,7 +113,7 @@ def test_product_type_delete_mutation_variants_in_draft_order(
     draft_order.save(update_fields=["status"])
 
     variant_channel_listing = variant.channel_listings.get(channel=channel_USD)
-    net = variant.get_price(product, [], channel_USD, variant_channel_listing, None)
+    net = variant.get_price(variant_channel_listing)
     gross = Money(amount=net.amount, currency=net.currency)
     quantity = 3
     unit_price = TaxedMoney(net=net, gross=gross)

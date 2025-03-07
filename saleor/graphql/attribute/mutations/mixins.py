@@ -5,7 +5,9 @@ from text_unidecode import unidecode
 from ....attribute import ATTRIBUTE_PROPERTIES_CONFIGURATION, AttributeInputType
 from ....attribute import models as models
 from ....attribute.error_codes import AttributeErrorCode
-from ...core.utils import validate_slug_and_generate_if_needed
+from ....core.utils import prepare_unique_slug
+from ...core import ResolveInfo
+from ...core.validators import validate_slug_and_generate_if_needed
 
 
 class AttributeMixin:
@@ -42,8 +44,13 @@ class AttributeMixin:
             )
 
         is_swatch_attr = attribute_input_type == AttributeInputType.SWATCH
+
+        slug_list = list(
+            attribute.values.values_list("slug", flat=True) if attribute.pk else []
+        )
+
         for value_data in values_input:
-            cls._validate_value(attribute, value_data, is_swatch_attr)
+            cls._validate_value(attribute, value_data, is_swatch_attr, slug_list)
 
         cls.check_values_are_unique(values_input, attribute)
 
@@ -53,6 +60,7 @@ class AttributeMixin:
         attribute: models.Attribute,
         value_data: dict,
         is_swatch_attr: bool,
+        slug_list: list,
     ):
         """Validate the new attribute value."""
         value = value_data.get("name")
@@ -71,25 +79,26 @@ class AttributeMixin:
         else:
             cls.validate_non_swatch_attr_value(value_data)
 
-        slug_value = value
-        value_data["slug"] = slugify(unidecode(slug_value))
+        slug_value = prepare_unique_slug(slugify(unidecode(value)), slug_list)
+        value_data["slug"] = slug_value
+        slug_list.append(slug_value)
 
         attribute_value = models.AttributeValue(**value_data, attribute=attribute)
         try:
             attribute_value.full_clean()
-        except ValidationError as validation_errors:
-            for field, err in validation_errors.error_dict.items():
+        except ValidationError as e:
+            for field, err in e.error_dict.items():
                 if field == "attribute":
                     continue
                 errors = []
                 for error in err:
                     error.code = AttributeErrorCode.INVALID.value
                     errors.append(error)
-                raise ValidationError({cls.ATTRIBUTE_VALUES_FIELD: errors})
+                raise ValidationError({cls.ATTRIBUTE_VALUES_FIELD: errors}) from e
 
     @classmethod
     def validate_non_swatch_attr_value(cls, value_data: dict):
-        if any([value_data.get(field) for field in cls.ONLY_SWATCH_FIELDS]):
+        if any(value_data.get(field) for field in cls.ONLY_SWATCH_FIELDS):
             raise ValidationError(
                 {
                     cls.ATTRIBUTE_VALUES_FIELD: ValidationError(
@@ -115,12 +124,15 @@ class AttributeMixin:
     @classmethod
     def check_values_are_unique(cls, values_input: dict, attribute: models.Attribute):
         # Check values uniqueness in case of creating new attribute.
-        existing_values = attribute.values.values_list("slug", flat=True)
+        existing_names = (
+            attribute.values.values_list("name", flat=True) if attribute.pk else []
+        )
+        existing_names = [name.lower().strip() for name in existing_names]
         for value_data in values_input:
-            slug = slugify(unidecode(value_data["name"]))
-            if slug in existing_values:
+            name = unidecode(value_data["name"]).lower().strip()
+            if name in existing_names:
                 msg = (
-                    f'Value {value_data["name"]} already exists within this attribute.'
+                    f"Value {value_data['name']} already exists within this attribute."
                 )
                 raise ValidationError(
                     {
@@ -130,10 +142,8 @@ class AttributeMixin:
                     }
                 )
 
-        new_slugs = [
-            slugify(unidecode(value_data["name"])) for value_data in values_input
-        ]
-        if len(set(new_slugs)) != len(new_slugs):
+        new_names = [value_data["name"].lower().strip() for value_data in values_input]
+        if len(set(new_names)) != len(new_names):
             raise ValidationError(
                 {
                     cls.ATTRIBUTE_VALUES_FIELD: ValidationError(
@@ -149,9 +159,9 @@ class AttributeMixin:
             cleaned_input = validate_slug_and_generate_if_needed(
                 instance, "name", cleaned_input
             )
-        except ValidationError as error:
-            error.code = AttributeErrorCode.REQUIRED.value
-            raise ValidationError({"slug": error})
+        except ValidationError as e:
+            e.code = AttributeErrorCode.REQUIRED.value
+            raise ValidationError({"slug": e}) from e
         cls._clean_attribute_settings(instance, cleaned_input)
 
         return cleaned_input
@@ -177,8 +187,8 @@ class AttributeMixin:
             raise ValidationError(errors)
 
     @classmethod
-    def _save_m2m(cls, info, attribute, cleaned_data):
-        super()._save_m2m(info, attribute, cleaned_data)
+    def _save_m2m(cls, info: ResolveInfo, attribute, cleaned_data):
+        super()._save_m2m(info, attribute, cleaned_data)  # type: ignore[misc] # mixin
         values = cleaned_data.get(cls.ATTRIBUTE_VALUES_FIELD) or []
         for value in values:
             attribute.values.create(**value)

@@ -1,12 +1,12 @@
 from unittest.mock import patch
 
-import before_after
 import graphene
 import pytest
 from django.db import transaction
 
 from .....graphql.tests.utils import get_graphql_content
 from .....product.error_codes import ProductErrorCode
+from .....tests import race_condition
 
 PRODUCT_MEDIA_REORDER = """
     mutation reorderMedia($product_id: ID!, $media_ids: [ID!]!) {
@@ -109,8 +109,10 @@ def test_reorder_not_existing_media(
         with transaction.atomic():
             media.delete()
 
-    with before_after.before(
-        "saleor.graphql.product.mutations.products.update_ordered_media", delete_media
+    with race_condition.RunBefore(
+        "saleor.graphql.product.mutations.product.product_media_reorder"
+        ".update_ordered_media",
+        delete_media,
     ):
         variables = {"product_id": product_id, "media_ids": [media_1_id, media_0_id]}
         response = staff_api_client.post_graphql(

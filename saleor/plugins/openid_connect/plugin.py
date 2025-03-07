@@ -1,15 +1,14 @@
 import logging
-from typing import Optional, Tuple
+from typing import cast
 
 from authlib.common.errors import AuthlibBaseError
-from authlib.integrations.requests_client import OAuth2Session
 from django.core import signing
 from django.core.exceptions import ValidationError
-from django.core.handlers.wsgi import WSGIRequest
-from jwt import ExpiredSignatureError, InvalidTokenError
+from jwt import DecodeError, ExpiredSignatureError, InvalidTokenError
 from requests import HTTPError, PreparedRequest
 
 from ...account.models import User
+from ...account.utils import get_user_groups_permissions
 from ...core.auth import get_token_from_request
 from ...core.jwt import (
     JWT_REFRESH_TOKEN_COOKIE_NAME,
@@ -18,25 +17,31 @@ from ...core.jwt import (
     get_user_from_payload,
     jwt_decode,
 )
-from ...core.permissions import get_permissions_codename, get_permissions_from_names
+from ...graphql.core import SaleorContext
+from ...permission.enums import get_permissions_codename, get_permissions_from_names
 from ..base_plugin import BasePlugin, ConfigurationTypeField, ExternalAccessTokens
 from ..error_codes import PluginErrorCode
 from ..models import PluginConfiguration
 from . import PLUGIN_ID
+from .client import OAuth2Client
 from .const import SALEOR_STAFF_PERMISSION
 from .dataclasses import OpenIDConnectConfig
 from .exceptions import AuthenticationError
 from .utils import (
     OAUTH_TOKEN_REFRESH_FIELD,
+    assign_staff_to_default_group_and_update_permissions,
     create_tokens_from_oauth_payload,
+    get_domain_from_email,
     get_incorrect_fields,
     get_or_create_user_from_payload,
     get_parsed_id_token,
     get_saleor_permission_names,
     get_saleor_permissions_qs_from_scope,
+    get_staff_user_domains,
     get_user_from_oauth_access_token,
     get_user_from_token,
     is_owner_of_token_valid,
+    send_user_event,
     validate_refresh_token,
 )
 
@@ -56,6 +61,8 @@ class OpenIDConnectPlugin(BasePlugin):
         {"name": "user_info_url", "value": None},
         {"name": "audience", "value": None},
         {"name": "use_oauth_scope_permissions", "value": False},
+        {"name": "staff_user_domains", "value": None},
+        {"name": "default_group_name_for_new_staff_users", "value": None},
     ]
     PLUGIN_NAME = "OpenID Connect"
     CONFIGURATION_PER_CHANNEL = False
@@ -140,6 +147,24 @@ class OpenIDConnectPlugin(BasePlugin):
             ),
             "label": "Use OAuth scope permissions",
         },
+        "staff_user_domains": {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": (
+                "Provide the domains of the user emails, separated by commas, "
+                "that should be treated as staff users (e.g. example.com)."
+            ),
+            "label": "Staff user domains",
+        },
+        "default_group_name_for_new_staff_users": {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": (
+                "Provide the name of the default permission group to which the new "
+                "staff user should be assigned to. When the provided group doesn't "
+                "exist, the new group without any permissions and any channels "
+                "will be created."
+            ),
+            "label": "Default permission group name for new staff users",
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -157,6 +182,8 @@ class OpenIDConnectPlugin(BasePlugin):
             audience=configuration["audience"],
             use_scope_permissions=configuration["use_oauth_scope_permissions"],
             user_info_url=configuration["user_info_url"],
+            staff_user_domains=configuration["staff_user_domains"],
+            default_group_name=configuration["default_group_name_for_new_staff_users"],
         )
 
         # Determine, if we have defined all fields required to use OAuth access token
@@ -200,7 +227,7 @@ class OpenIDConnectPlugin(BasePlugin):
             scope += f" {scope_permissions}"
         if self.config.enable_refresh_token:
             scope += " offline_access"
-        return OAuth2Session(
+        return OAuth2Client(
             client_id=self.config.client_id,
             client_secret=self.config.client_secret,
             scope=scope,
@@ -215,7 +242,7 @@ class OpenIDConnectPlugin(BasePlugin):
         return user_permissions
 
     def external_obtain_access_tokens(
-        self, data: dict, request: WSGIRequest, previous_value
+        self, data: dict, request: SaleorContext, previous_value
     ) -> ExternalAccessTokens:
         if not self.active:
             return previous_value
@@ -239,11 +266,11 @@ class OpenIDConnectPlugin(BasePlugin):
 
         try:
             state_data = signing.loads(state)
-        except signing.BadSignature:
+        except signing.BadSignature as e:
             msg = "Bad signature"
             raise ValidationError(
                 {"state": ValidationError(msg, code=PluginErrorCode.INVALID.value)}
-            )
+            ) from e
 
         redirect_uri = state_data.get("redirectUri")
         if not redirect_uri:
@@ -252,40 +279,69 @@ class OpenIDConnectPlugin(BasePlugin):
                 {"code": ValidationError(msg, code=PluginErrorCode.INVALID.value)}
             )
 
-        token_data = self.oauth.fetch_token(
-            self.config.token_url, code=code, redirect_uri=redirect_uri
-        )
+        try:
+            token_data = self.oauth.fetch_token(
+                self.config.token_url, code=code, redirect_uri=redirect_uri
+            )
+        except AuthlibBaseError as e:
+            raise ValidationError(
+                {
+                    "code": ValidationError(
+                        e.description, code=PluginErrorCode.INVALID.value
+                    )
+                }
+            ) from e
 
-        parsed_id_token = get_parsed_id_token(
-            token_data, self.config.json_web_key_set_url
-        )
-
-        user = get_or_create_user_from_payload(
-            parsed_id_token, self.config.authorization_url
-        )
+        try:
+            parsed_id_token = get_parsed_id_token(
+                token_data, self.config.json_web_key_set_url
+            )
+            user, user_created, user_updated = get_or_create_user_from_payload(
+                parsed_id_token,
+                self.config.authorization_url,
+            )
+        except AuthenticationError as e:
+            raise ValidationError(
+                {"code": ValidationError(str(e), code=PluginErrorCode.INVALID.value)}
+            ) from e
 
         user_permissions = []
-        if self.config.use_scope_permissions:
+        is_staff_user_email = self.is_staff_user_email(user)
+        if self.config.use_scope_permissions or is_staff_user_email:
             scope = token_data.get("scope")
             user_permissions = self._use_scope_permissions(user, scope)
-            if not user.is_staff and bool(
-                SALEOR_STAFF_PERMISSION in scope or user_permissions
-            ):
-                user.is_staff = True
-                user.save(update_fields=["is_staff"])
-            elif user.is_staff and not bool(
-                SALEOR_STAFF_PERMISSION in scope or user_permissions
-            ):
+
+            is_staff_in_scope = SALEOR_STAFF_PERMISSION in scope
+            is_staff_user = is_staff_in_scope or user_permissions or is_staff_user_email
+            if is_staff_user:
+                assign_staff_to_default_group_and_update_permissions(
+                    user, self.config.default_group_name
+                )
+                if not user.is_staff:
+                    user.is_staff = True
+                    user_updated = True
+                    user.save(update_fields=["is_staff"])
+            elif user.is_staff and not is_staff_user:
                 user.is_staff = False
+                user_updated = True
                 user.save(update_fields=["is_staff"])
+
+        if user_created or user_updated:
+            send_user_event(user, user_created, user_updated)
 
         tokens = create_tokens_from_oauth_payload(
             token_data, user, parsed_id_token, user_permissions, owner=self.PLUGIN_ID
         )
         return ExternalAccessTokens(user=user, **tokens)
 
+    def is_staff_user_email(self, user: "User"):
+        """Return True if the user email is from staff user domains."""
+        staff_user_domains = get_staff_user_domains(self.config)
+        email_domain = get_domain_from_email(user.email)
+        return email_domain in staff_user_domains
+
     def external_authentication_url(
-        self, data: dict, request: WSGIRequest, previous_value
+        self, data: dict, request: SaleorContext, previous_value
     ) -> dict:
         if not self.active:
             return previous_value
@@ -315,7 +371,7 @@ class OpenIDConnectPlugin(BasePlugin):
         return {"authorizationUrl": uri}
 
     def external_refresh(
-        self, data: dict, request: WSGIRequest, previous_value
+        self, data: dict, request: SaleorContext, previous_value
     ) -> ExternalAccessTokens:
         if not self.active:
             return previous_value
@@ -335,14 +391,15 @@ class OpenIDConnectPlugin(BasePlugin):
         refresh_token = data.get("refreshToken") or refresh_token
 
         validate_refresh_token(refresh_token, data)
-        saleor_refresh_token = jwt_decode(refresh_token)  # type: ignore
+        refresh_token = cast(str, refresh_token)
+        saleor_refresh_token = jwt_decode(refresh_token)
         token_endpoint = self.config.token_url
         try:
             token_data = self.oauth.refresh_token(
                 token_endpoint,
                 refresh_token=saleor_refresh_token[OAUTH_TOKEN_REFRESH_FIELD],
             )
-        except (AuthlibBaseError, HTTPError):
+        except (AuthlibBaseError, HTTPError) as e:
             logger.warning("Unable to refresh the token.", exc_info=True)
             raise ValidationError(
                 {
@@ -351,18 +408,16 @@ class OpenIDConnectPlugin(BasePlugin):
                         code=error_code,
                     )
                 }
-            )
+            ) from e
         try:
             parsed_id_token = get_parsed_id_token(
                 token_data, self.config.json_web_key_set_url
             )
             user = get_user_from_token(parsed_id_token)
 
-            user_permissions = []
-            if self.config.use_scope_permissions:
-                user_permissions = self._use_scope_permissions(
-                    user, token_data.get("scope")
-                )
+            user_permissions = self.get_and_update_user_permissions(
+                user, self.config.use_scope_permissions, token_data.get("scope")
+            )
 
             tokens = create_tokens_from_oauth_payload(
                 token_data,
@@ -375,9 +430,22 @@ class OpenIDConnectPlugin(BasePlugin):
         except AuthenticationError as e:
             raise ValidationError(
                 {"refreshToken": ValidationError(str(e), code=error_code)}
-            )
+            ) from e
 
-    def external_logout(self, data: dict, request: WSGIRequest, previous_value):
+    def get_and_update_user_permissions(
+        self, user: User, use_scope_permissions: bool, scope: str
+    ):
+        """Update user permissions based on scope and user groups' permissions."""
+        permissions = get_user_groups_permissions(user)
+        if use_scope_permissions and scope:
+            permissions |= get_saleor_permissions_qs_from_scope(scope)
+        user.effective_permissions = permissions
+        user_permissions = (
+            get_saleor_permission_names(permissions) if permissions else []
+        )
+        return user_permissions
+
+    def external_logout(self, data: dict, request: SaleorContext, previous_value):
         if not self.active:
             return previous_value
 
@@ -393,8 +461,8 @@ class OpenIDConnectPlugin(BasePlugin):
         return {"logoutUrl": req.url}
 
     def external_verify(
-        self, data: dict, request: WSGIRequest, previous_value
-    ) -> Tuple[Optional[User], dict]:
+        self, data: dict, request: SaleorContext, previous_value
+    ) -> tuple[User | None, dict]:
         if not self.active:
             return previous_value
 
@@ -414,16 +482,17 @@ class OpenIDConnectPlugin(BasePlugin):
                 return previous_value
             user.is_staff = False
         except (ExpiredSignatureError, InvalidTokenError) as e:
-            raise ValidationError({"token": e})
+            raise ValidationError({"token": e}) from e
         permissions = payload.get(PERMISSIONS_FIELD)
-        if permissions is not None:
-            user.effective_permissions = get_permissions_from_names(  # type: ignore
-                permissions
-            )
+        if permissions:
             user.is_staff = True
+            user.effective_permissions = get_permissions_from_names(permissions)
+            assign_staff_to_default_group_and_update_permissions(
+                user, self.config.default_group_name
+            )
         return user, payload
 
-    def authenticate_user(self, request: WSGIRequest, previous_value) -> Optional[User]:
+    def authenticate_user(self, request: SaleorContext, previous_value) -> User | None:
         if not self.active:
             return previous_value
         token = get_token_from_request(request)
@@ -434,16 +503,30 @@ class OpenIDConnectPlugin(BasePlugin):
             token, owner=self.PLUGIN_ID
         ):
             # Check if the token is created by this plugin
-            payload = jwt_decode(token)
-            user = get_user_from_access_payload(payload, request)
+            try:
+                payload = jwt_decode(token)
+                user = get_user_from_access_payload(payload, request)
+            except (InvalidTokenError, DecodeError):
+                return previous_value
+            if user.is_staff:
+                assign_staff_to_default_group_and_update_permissions(
+                    user, self.config.default_group_name
+                )
             return user
 
+        staff_user_domains = get_staff_user_domains(self.config)
+
         if self.use_oauth_access_token:
-            user = get_user_from_oauth_access_token(
-                token,
-                self.config.json_web_key_set_url,
-                self.config.user_info_url,
-                self.config.use_scope_permissions,
-                self.config.audience,
-            )
+            try:
+                user = get_user_from_oauth_access_token(
+                    token,
+                    self.config.json_web_key_set_url,
+                    self.config.user_info_url,
+                    self.config.use_scope_permissions,
+                    self.config.audience,
+                    staff_user_domains,
+                    self.config.default_group_name,
+                )
+            except AuthenticationError:
+                return previous_value
         return user or previous_value

@@ -1,16 +1,22 @@
+from typing import Generic, TypeVar
 from uuid import UUID
 
 from django.db.models import Model, Q
-from graphene.types.objecttype import ObjectType, ObjectTypeOptions
+from graphene.types.objecttype import ObjectTypeOptions
 
+from ..doc_category import DOC_CATEGORY_MAP
 from . import TYPES_WITH_DOUBLE_ID_AVAILABLE
+from .base import BaseObjectType
 
 
 class ModelObjectOptions(ObjectTypeOptions):
     model = None
 
 
-class ModelObjectType(ObjectType):
+MT = TypeVar("MT", bound=Model)
+
+
+class ModelObjectType(Generic[MT], BaseObjectType):
     @classmethod
     def __init_subclass_with_meta__(
         cls,
@@ -18,6 +24,7 @@ class ModelObjectType(ObjectType):
         possible_types=(),
         default_resolver=None,
         _meta=None,
+        doc_category=None,
         **options,
     ):
         if not _meta:
@@ -28,16 +35,23 @@ class ModelObjectType(ObjectType):
                 raise ValueError(
                     "ModelObjectType was declared without 'model' option in it's Meta."
                 )
-            elif not issubclass(options["model"], Model):
+            if not issubclass(options["model"], Model):
                 raise ValueError(
                     "ModelObjectType was declared with invalid 'model' option value "
                     "in it's Meta. Expected subclass of django.db.models.Model, "
                     f"received '{type(options['model'])}' type."
                 )
 
-            _meta.model = options.pop("model")
+            model = options.pop("model")
+            _meta.model = model
 
-        super(ModelObjectType, cls).__init_subclass_with_meta__(
+            doc_category_key = f"{model._meta.app_label}.{model.__name__}"
+            if doc_category not in options:
+                options["doc_category"] = doc_category
+            if not options["doc_category"] and doc_category_key in DOC_CATEGORY_MAP:
+                options["doc_category"] = DOC_CATEGORY_MAP[doc_category_key]
+
+        super().__init_subclass_with_meta__(
             interfaces=interfaces,
             possible_types=possible_types,
             default_resolver=default_resolver,
@@ -46,7 +60,7 @@ class ModelObjectType(ObjectType):
         )
 
     @classmethod
-    def get_node(cls, _, id):
+    def get_node(cls, _, id) -> MT | None:
         model = cls._meta.model
         type_name = cls._meta.name
         lookup = Q(pk=id)
@@ -67,5 +81,5 @@ class ModelObjectType(ObjectType):
             return None
 
     @classmethod
-    def get_model(cls):
+    def get_model(cls) -> type[MT]:
         return cls._meta.model

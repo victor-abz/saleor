@@ -1,85 +1,121 @@
-import json
 from unittest import mock
 
 import graphene
-import pytest
 
-from .....discount.models import Sale, SaleChannelListing
-from .....discount.utils import fetch_catalogue_info
-from .....webhook.payloads import generate_sale_payload
+from .....discount.error_codes import DiscountErrorCode
+from .....discount.models import Promotion, PromotionRule
+from .....product.models import ProductChannelListing, ProductVariant
 from ....tests.utils import get_graphql_content
-from ...mutations.utils import convert_catalogue_info_to_global_ids
-
-
-@pytest.fixture
-def sale_list(channel_USD):
-    sales = Sale.objects.bulk_create(
-        [Sale(name="Sale 1"), Sale(name="Sale 2"), Sale(name="Sale 3")]
-    )
-    SaleChannelListing.objects.bulk_create(
-        [
-            SaleChannelListing(sale=sale, discount_value=5, channel=channel_USD)
-            for sale in sales
-        ]
-    )
-    return list(sales)
-
 
 SALE_BULK_DELETE_MUTATION = """
     mutation saleBulkDelete($ids: [ID!]!) {
         saleBulkDelete(ids: $ids) {
             count
+            errors {
+                field
+                code
+            }
         }
     }
     """
 
 
-def test_delete_sales(staff_api_client, sale_list, permission_manage_discounts):
+@mock.patch("saleor.graphql.discount.mutations.bulk_mutations.get_webhooks_for_event")
+@mock.patch("saleor.plugins.manager.PluginsManager.sale_deleted")
+def test_delete_sales(
+    deleted_webhook_mock,
+    mocked_get_webhooks_for_event,
+    staff_api_client,
+    promotion_converted_from_sale_list,
+    permission_manage_discounts,
+    any_webhook,
+    settings,
+):
+    # given
+    rules_to_delete = PromotionRule.objects.filter(
+        promotion_id__in=[
+            promotion.id for promotion in promotion_converted_from_sale_list
+        ]
+    )
+    variant_ids = PromotionRule.variants.through.objects.filter(
+        promotionrule_id__in=rules_to_delete
+    ).values_list("productvariant_id", flat=True)
+    product_ids = ProductVariant.objects.filter(id__in=variant_ids).values_list(
+        "product_id", flat=True
+    )
 
+    promotion_list = promotion_converted_from_sale_list
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     variables = {
-        "ids": [graphene.Node.to_global_id("Sale", sale.id) for sale in sale_list]
+        "ids": [
+            graphene.Node.to_global_id("Sale", promotion.old_sale_id)
+            for promotion in promotion_list
+        ]
     }
+
+    # when
     response = staff_api_client.post_graphql(
         SALE_BULK_DELETE_MUTATION, variables, permissions=[permission_manage_discounts]
     )
+
+    # then
     content = get_graphql_content(response)
 
     assert content["data"]["saleBulkDelete"]["count"] == 3
-    assert not Sale.objects.filter(id__in=[sale.id for sale in sale_list]).exists()
+    assert not Promotion.objects.filter(
+        id__in=[promotion.id for promotion in promotion_list]
+    ).exists()
+
+    assert not ProductChannelListing.objects.filter(
+        product_id__in=product_ids, discounted_price_dirty=False
+    ).exists()
+
+    assert deleted_webhook_mock.call_count == len(promotion_list)
 
 
-@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.graphql.discount.mutations.bulk_mutations.get_webhooks_for_event")
 @mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_delete_sales_triggers_webhook(
     mocked_webhook_trigger,
     mocked_get_webhooks_for_event,
     staff_api_client,
-    sale_list,
+    promotion_converted_from_sale_list,
     permission_manage_discounts,
     any_webhook,
     settings,
 ):
+    # given
     mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+    promotion_list = promotion_converted_from_sale_list
+
     variables = {
-        "ids": [graphene.Node.to_global_id("Sale", sale.id) for sale in sale_list]
+        "ids": [
+            graphene.Node.to_global_id("Sale", promotion.old_sale_id)
+            for promotion in promotion_list
+        ]
     }
+
+    # when
     response = staff_api_client.post_graphql(
         SALE_BULK_DELETE_MUTATION, variables, permissions=[permission_manage_discounts]
     )
+
+    # then
     content = get_graphql_content(response)
 
     assert content["data"]["saleBulkDelete"]["count"] == 3
     assert mocked_webhook_trigger.call_count == 3
 
 
-@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.graphql.discount.mutations.bulk_mutations.get_webhooks_for_event")
 @mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_delete_sales_with_variants_triggers_webhook(
     mocked_webhook_trigger,
     mocked_get_webhooks_for_event,
     staff_api_client,
-    sale_list,
+    promotion_converted_from_sale_list,
     permission_manage_discounts,
     any_webhook,
     settings,
@@ -89,46 +125,97 @@ def test_delete_sales_with_variants_triggers_webhook(
     product_variant_list,
 ):
     # given
-    for sale in sale_list:
-        sale.products.add(product)
-        sale.collections.add(collection)
-        sale.categories.add(category)
-        sale.variants.add(*product_variant_list)
+    collection_id = graphene.Node.to_global_id("Collection", collection.id)
+    category_id = graphene.Node.to_global_id("Category", category.id)
+    product_id = graphene.Node.to_global_id("Product", product.id)
+    variant_ids = [
+        graphene.Node.to_global_id("ProductVariant", variant.id)
+        for variant in product_variant_list
+    ]
+    predicate = {
+        "OR": [
+            {"collectionPredicate": {"ids": [collection_id]}},
+            {"categoryPredicate": {"ids": [category_id]}},
+            {"productPredicate": {"ids": [product_id]}},
+            {"variantPredicate": {"ids": variant_ids}},
+        ]
+    }
 
-    # create list of payloads that should be called in mutation
-    payloads_per_sale = []
-    for sale in sale_list:
-        payloads_per_sale.append(
-            generate_sale_payload(
-                sale,
-                convert_catalogue_info_to_global_ids(fetch_catalogue_info(sale)),
-                requestor=staff_api_client.user,
-            )
-        )
+    promotion_list = promotion_converted_from_sale_list
+    rules = [promotion.rules.first() for promotion in promotion_list]
+    for rule in rules:
+        rule.catalogue_predicate = predicate
+
+    PromotionRule.objects.bulk_update(rules, fields=["catalogue_predicate"])
 
     mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     variables = {
-        "ids": [graphene.Node.to_global_id("Sale", sale.id) for sale in sale_list]
+        "ids": [
+            graphene.Node.to_global_id("Sale", promotion.old_sale_id)
+            for promotion in promotion_list
+        ]
     }
+
     # when
     response = staff_api_client.post_graphql(
         SALE_BULK_DELETE_MUTATION, variables, permissions=[permission_manage_discounts]
     )
-    content = get_graphql_content(response)
-    # create a list of payloads with which the webhook was called
-    called_payloads_list = []
-    for arg_list in mocked_webhook_trigger.call_args_list:
-        called_arg = json.loads(arg_list[0][0])
-        # we don't want to compare meta fields, only rest of payloads
-        called_arg[0].pop("meta")
-        called_payloads_list.append(called_arg)
 
     # then
-    for payload in payloads_per_sale:
-        payload = json.loads(payload)
-        payload[0].pop("meta")
-        assert payload in called_payloads_list
-
+    content = get_graphql_content(response)
     assert content["data"]["saleBulkDelete"]["count"] == 3
     assert mocked_webhook_trigger.call_count == 3
+
+
+@mock.patch("saleor.graphql.discount.mutations.bulk_mutations.get_webhooks_for_event")
+@mock.patch("saleor.plugins.manager.PluginsManager.sale_deleted")
+def test_delete_sales_with_promotion_ids(
+    deleted_webhook_mock,
+    mocked_get_webhooks_for_event,
+    staff_api_client,
+    any_webhook,
+    promotion_converted_from_sale_list,
+    permission_manage_discounts,
+    settings,
+):
+    # given
+    rules_to_delete = PromotionRule.objects.filter(
+        promotion_id__in=[
+            promotion.id for promotion in promotion_converted_from_sale_list
+        ]
+    )
+    variant_ids = PromotionRule.variants.through.objects.filter(
+        promotionrule_id__in=rules_to_delete
+    ).values_list("productvariant_id", flat=True)
+    product_ids = ProductVariant.objects.filter(id__in=variant_ids).values_list(
+        "product_id", flat=True
+    )
+
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+    variables = {
+        "ids": [
+            graphene.Node.to_global_id("Promotion", promotion.id)
+            for promotion in promotion_converted_from_sale_list
+        ]
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        SALE_BULK_DELETE_MUTATION, variables, permissions=[permission_manage_discounts]
+    )
+
+    # then
+    content = get_graphql_content(response)
+
+    assert not content["data"]["saleBulkDelete"]["count"]
+    errors = content["data"]["saleBulkDelete"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["field"] == "id"
+    assert errors[0]["code"] == DiscountErrorCode.INVALID.name
+
+    deleted_webhook_mock.assert_not_called()
+    assert not ProductChannelListing.objects.filter(
+        product_id__in=product_ids, discounted_price_dirty=True
+    ).exists()

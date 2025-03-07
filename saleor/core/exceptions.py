@@ -1,6 +1,8 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, List, Optional, Union
+from typing import TYPE_CHECKING, Optional
+from uuid import UUID
 
 from graphql import GraphQLError
 
@@ -14,15 +16,21 @@ if TYPE_CHECKING:
 
 @dataclass
 class InsufficientStockData:
+    available_quantity: int
     variant: Optional["ProductVariant"] = None
     checkout_line: Optional["CheckoutLine"] = None
     order_line: Optional["OrderLine"] = None
-    warehouse_pk: Union[str, int, None] = None
-    available_quantity: Optional[int] = None
+    warehouse_pk: UUID | None = None
+
+
+class NonExistingCheckoutLines(Exception):
+    def __init__(self, line_pks: set[UUID]):
+        self.line_pks = line_pks
+        super().__init__("Checkout lines don't exist.")
 
 
 class InsufficientStock(Exception):
-    def __init__(self, items: List[InsufficientStockData]):
+    def __init__(self, items: list[InsufficientStockData]):
         details = [str(item.variant or item.order_line) for item in items]
         super().__init__(f"Insufficient stock for {', '.join(details)}")
         self.items = items
@@ -42,13 +50,6 @@ class PreorderAllocationError(Exception):
         self.order_line = order_line
 
 
-class ReadOnlyException(Exception):
-    def __init__(self, msg=None):
-        if msg is None:
-            msg = "API runs in read-only mode"
-        super().__init__(msg)
-
-
 class ProductNotPublished(Exception):
     def __init__(self, context=None):
         super().__init__("Can't add unpublished product.")
@@ -57,12 +58,13 @@ class ProductNotPublished(Exception):
 
 
 class PermissionDenied(Exception):
-    def __init__(self, message=None, *, permissions: Iterable[Enum] = None):
+    def __init__(self, message=None, *, permissions: Iterable[Enum] | None = None):
         if not message:
             if permissions:
                 permission_list = ", ".join(p.name for p in permissions)
                 message = (
-                    f"You need one of the following permissions: {permission_list}"
+                    "To access this path, you need one of the "
+                    f"following permissions: {permission_list}"
                 )
             else:
                 message = "You do not have permission to perform this action"
@@ -83,7 +85,7 @@ class CircularSubscriptionSyncEvent(GraphQLError):
 
 class SyncEventError(Exception):
     def __init__(self, message, code=None):
-        super(SyncEventError, self).__init__(message, code)
+        super().__init__(message, code)
         self.message = message
         self.code = code
 

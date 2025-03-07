@@ -1,16 +1,16 @@
+import datetime
 import json
-from datetime import datetime, timedelta
 from unittest.mock import ANY, patch
 from uuid import uuid4
 
 import graphene
-import pytz
 from django.conf import settings
 from django.utils.text import slugify
 from freezegun import freeze_time
 
+from .....discount.utils.promotion import get_active_catalogue_promotion_rules
 from .....product.error_codes import ProductErrorCode
-from .....tests.utils import dummy_editorjs, flush_post_commit_hooks
+from .....tests.utils import dummy_editorjs
 from ....core.enums import WeightUnitsEnum
 from ....tests.utils import get_graphql_content
 
@@ -68,6 +68,7 @@ CREATE_VARIANT_MUTATION = """
                             key
                             value
                         }
+                        externalReference
                     }
                 }
             }
@@ -104,6 +105,7 @@ def test_create_variant_with_name(
             "quantity": 20,
         }
     ]
+    external_reference = "test-ext-ref"
 
     variables = {
         "input": {
@@ -116,6 +118,7 @@ def test_create_variant_with_name(
             "trackInventory": True,
             "metadata": [{"key": metadata_key, "value": metadata_value}],
             "privateMetadata": [{"key": metadata_key, "value": metadata_value}],
+            "externalReference": external_reference,
         }
     }
 
@@ -124,7 +127,6 @@ def test_create_variant_with_name(
         CREATE_VARIANT_MUTATION, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     # then
     assert not content["errors"]
@@ -142,9 +144,12 @@ def test_create_variant_with_name(
     assert data["metadata"][0]["value"] == metadata_value
     assert data["privateMetadata"][0]["key"] == metadata_key
     assert data["privateMetadata"][0]["value"] == metadata_value
+    assert data["externalReference"] == external_reference
 
     created_webhook_mock.assert_called_once_with(product.variants.last())
     updated_webhook_mock.assert_not_called()
+    for rule in get_active_catalogue_promotion_rules():
+        assert rule.variants_dirty
 
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_created")
@@ -191,7 +196,6 @@ def test_create_variant_without_name(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     # then
     assert not content["errors"]
@@ -207,6 +211,52 @@ def test_create_variant_without_name(
     assert data["stocks"][0]["warehouse"]["slug"] == warehouse.slug
     created_webhook_mock.assert_called_once_with(product.variants.last())
     updated_webhook_mock.assert_not_called()
+
+
+def test_create_variant_empty_product_id(
+    staff_api_client,
+    product_type,
+    permission_manage_products,
+    warehouse,
+):
+    # given
+    query = CREATE_VARIANT_MUTATION
+    sku = "1"
+    weight = 10.22
+    attribute_id = graphene.Node.to_global_id(
+        "Attribute", product_type.variant_attributes.first().pk
+    )
+    variant_value = "test-value"
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.pk),
+            "quantity": 20,
+        }
+    ]
+
+    variables = {
+        "input": {
+            "product": "",
+            "sku": sku,
+            "stocks": stocks,
+            "weight": weight,
+            "attributes": [{"id": attribute_id, "values": [variant_value]}],
+            "trackInventory": True,
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    content = get_graphql_content(response)["data"]["productVariantCreate"]
+
+    # then
+    assert not content["productVariant"]
+    assert len(content["errors"]) == 1
+    error = content["errors"][0]
+    assert error["field"] == "product"
+    assert error["code"] == ProductErrorCode.INVALID.name
 
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_created")
@@ -227,7 +277,7 @@ def test_create_variant_preorder(
     variant_value = "test-value"
     global_threshold = 10
     end_date = (
-        (datetime.now() + timedelta(days=3))
+        (datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(days=3))
         .astimezone()
         .replace(microsecond=0)
         .isoformat()
@@ -250,7 +300,6 @@ def test_create_variant_preorder(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -303,7 +352,6 @@ def test_create_variant_no_required_attributes(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -365,7 +413,6 @@ def test_create_variant_with_file_attribute(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -428,7 +475,6 @@ def test_create_variant_with_boolean_attribute(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     data = content["productVariant"]
 
     assert not content["errors"]
@@ -499,7 +545,6 @@ def test_create_variant_with_file_attribute_new_value(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -561,7 +606,6 @@ def test_create_variant_with_file_attribute_no_file_url_given(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     errors = content["errors"]
     data = content["productVariant"]
@@ -628,7 +672,6 @@ def test_create_variant_with_page_reference_attribute(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -724,7 +767,6 @@ def test_create_variant_with_page_reference_attribute_no_references_given(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     errors = content["errors"]
     data = content["productVariant"]
 
@@ -792,7 +834,6 @@ def test_create_variant_with_product_reference_attribute(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -888,7 +929,6 @@ def test_create_variant_with_product_reference_attribute_no_references_given(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     errors = content["errors"]
     data = content["productVariant"]
 
@@ -963,7 +1003,6 @@ def test_create_variant_with_variant_reference_attribute(
 
     # then
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -1064,7 +1103,6 @@ def test_create_variant_with_variant_reference_attribute_no_references_given(
 
     # then
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     errors = content["errors"]
     data = content["productVariant"]
 
@@ -1457,7 +1495,6 @@ def test_create_variant_with_rich_text_attribute(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     data = content["productVariant"]
 
     assert not content["errors"]
@@ -1511,7 +1548,6 @@ def test_create_variant_with_plain_text_attribute(
 
     # then
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     data = content["productVariant"]
 
     assert not content["errors"]
@@ -1522,7 +1558,7 @@ def test_create_variant_with_plain_text_attribute(
 
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_created")
-@freeze_time(datetime(2020, 5, 5, 5, 5, 5, tzinfo=pytz.utc))
+@freeze_time(datetime.datetime(2020, 5, 5, 5, 5, 5, tzinfo=datetime.UTC))
 def test_create_variant_with_date_attribute(
     created_webhook_mock,
     permission_manage_products,
@@ -1539,7 +1575,7 @@ def test_create_variant_with_date_attribute(
     sku = "1"
     weight = 10.22
     date_attribute_id = graphene.Node.to_global_id("Attribute", date_attribute.id)
-    date_time_value = datetime.now(tz=pytz.utc)
+    date_time_value = datetime.datetime.now(tz=datetime.UTC)
     date_value = date_time_value.date()
 
     variables = {
@@ -1557,7 +1593,6 @@ def test_create_variant_with_date_attribute(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     data = content["productVariant"]
     variant = product.variants.last()
     expected_attributes_data = {
@@ -1585,7 +1620,7 @@ def test_create_variant_with_date_attribute(
 
 
 @patch("saleor.plugins.manager.PluginsManager.product_variant_created")
-@freeze_time(datetime(2020, 5, 5, 5, 5, 5, tzinfo=pytz.utc))
+@freeze_time(datetime.datetime(2020, 5, 5, 5, 5, 5, tzinfo=datetime.UTC))
 def test_create_variant_with_date_time_attribute(
     created_webhook_mock,
     permission_manage_products,
@@ -1604,7 +1639,7 @@ def test_create_variant_with_date_time_attribute(
     date_time_attribute_id = graphene.Node.to_global_id(
         "Attribute", date_time_attribute.id
     )
-    date_time_value = datetime.now(tz=pytz.utc)
+    date_time_value = datetime.datetime.now(tz=datetime.UTC)
 
     variables = {
         "input": {
@@ -1621,7 +1656,6 @@ def test_create_variant_with_date_time_attribute(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
     data = content["productVariant"]
     variant = product.variants.last()
     expected_attributes_data = {
@@ -1689,7 +1723,6 @@ def test_create_variant_with_empty_string_for_sku(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -1745,7 +1778,6 @@ def test_create_variant_without_sku(
         query, variables, permissions=[permission_manage_products]
     )
     content = get_graphql_content(response)["data"]["productVariantCreate"]
-    flush_post_commit_hooks()
 
     assert not content["errors"]
     data = content["productVariant"]
@@ -1768,6 +1800,7 @@ VARIANT_CREATE_MUTATION = """
         {
             productVariant {
                 id
+                trackInventory
             }
             errors {
                 field,
@@ -1837,3 +1870,69 @@ def test_variant_create_product_with_variant_attributes_variant_flag_false(
     errors = content["data"]["productVariantCreate"]["errors"]
     assert errors
     assert errors[0]["code"] == ProductErrorCode.INVALID.name
+
+
+def test_create_product_variant_with_non_unique_external_reference(
+    staff_api_client,
+    category,
+    product,
+    product_type,
+    permission_manage_products,
+):
+    # given
+    query = CREATE_VARIANT_MUTATION
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+    variant = product.variants.first()
+    attribute_id = graphene.Node.to_global_id(
+        "Attribute", product_type.variant_attributes.first().pk
+    )
+
+    ext_ref = "test-ext-ref"
+    variant.external_reference = ext_ref
+    variant.save(update_fields=["external_reference"])
+
+    variables = {
+        "input": {
+            "product": product_id,
+            "attributes": [{"id": attribute_id, "values": ["test-value"]}],
+            "externalReference": ext_ref,
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    error = content["data"]["productVariantCreate"]["errors"][0]
+    assert error["field"] == "externalReference"
+    assert error["code"] == ProductErrorCode.UNIQUE.name
+    assert (
+        error["message"]
+        == "Product variant with this External reference already exists."
+    )
+
+
+def test_variant_create_product_with_default_track_inventory(
+    product_with_product_attributes,
+    staff_api_client,
+    permission_manage_products,
+    site_settings,
+):
+    product = product_with_product_attributes
+
+    prod_id = graphene.Node.to_global_id("Product", product.pk)
+    input = {"sku": "my-sku", "product": prod_id, "attributes": []}
+    response = staff_api_client.post_graphql(
+        VARIANT_CREATE_MUTATION,
+        variables={"input": input},
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantCreate"]
+    assert (
+        data["productVariant"]["trackInventory"]
+        == site_settings.track_inventory_by_default
+    )

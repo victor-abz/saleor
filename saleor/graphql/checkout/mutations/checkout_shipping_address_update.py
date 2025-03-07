@@ -1,9 +1,10 @@
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 import graphene
 from django.core.exceptions import ValidationError
 
 from ....checkout import AddressType, models
+from ....checkout.actions import call_checkout_info_event
 from ....checkout.error_codes import CheckoutErrorCode
 from ....checkout.fetch import (
     CheckoutLineInfo,
@@ -12,30 +13,27 @@ from ....checkout.fetch import (
 )
 from ....checkout.utils import (
     change_shipping_address_in_checkout,
-    invalidate_checkout_prices,
-    is_shipping_required,
+    invalidate_checkout,
 )
 from ....core.tracing import traced_atomic_transaction
-from ....product import models as product_models
+from ....graphql.account.mixins import AddressMetadataMixin
 from ....warehouse.reservations import is_reservation_enabled
+from ....webhook.event_types import WebhookEventAsyncType
 from ...account.i18n import I18nMixin
 from ...account.types import AddressInput
-from ...core.descriptions import (
-    ADDED_IN_34,
-    ADDED_IN_35,
-    DEPRECATED_IN_3X_INPUT,
-    PREVIEW_FEATURE,
-)
+from ...core.context import SyncWebhookControlContext
+from ...core.descriptions import ADDED_IN_321, DEPRECATED_IN_3X_INPUT
+from ...core.doc_category import DOC_CATEGORY_CHECKOUT
 from ...core.mutations import BaseMutation
 from ...core.scalars import UUID
 from ...core.types import CheckoutError
-from ...discount.dataloaders import load_discounts
-from ...plugins.dataloaders import load_plugin_manager
+from ...core.utils import WebhookEventInfo
+from ...plugins.dataloaders import get_plugin_manager_promise
 from ...site.dataloaders import get_site_promise
 from ..types import Checkout
 from .checkout_create import CheckoutAddressValidationRules
 from .utils import (
-    ERROR_DOES_NOT_SHIP,
+    ERROR_CC_ADDRESS_CHANGE_FORBIDDEN,
     check_lines_quantity,
     get_checkout,
     update_checkout_shipping_method_if_invalid,
@@ -45,12 +43,12 @@ if TYPE_CHECKING:
     from ....checkout.fetch import DeliveryMethodBase
 
 
-class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
+class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixin):
     checkout = graphene.Field(Checkout, description="An updated checkout.")
 
     class Arguments:
         id = graphene.ID(
-            description="The checkout's ID." + ADDED_IN_34,
+            description="The checkout's ID.",
             required=False,
         )
         token = UUID(
@@ -67,36 +65,49 @@ class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
             required=True,
             description="The mailing address to where the checkout will be shipped.",
         )
+        save_address = graphene.Boolean(
+            required=False,
+            default_value=True,
+            description=(
+                "Indicates whether the shipping address should be saved "
+                "to the user’s address book upon checkout completion. "
+                "If not provided, the default behavior is to save the address."
+            )
+            + ADDED_IN_321,
+        )
         validation_rules = CheckoutAddressValidationRules(
             required=False,
             description=(
                 "The rules for changing validation for received shipping address data."
-                + ADDED_IN_35
-                + PREVIEW_FEATURE
             ),
         )
 
     class Meta:
         description = "Update shipping address in the existing checkout."
+        doc_category = DOC_CATEGORY_CHECKOUT
         error_type_class = CheckoutError
         error_type_field = "checkout_errors"
+        webhook_events_info = [
+            WebhookEventInfo(
+                type=WebhookEventAsyncType.CHECKOUT_UPDATED,
+                description="A checkout was updated.",
+            )
+        ]
 
     @classmethod
     def process_checkout_lines(
         cls,
         info,
-        lines: Iterable["CheckoutLineInfo"],
+        lines: list["CheckoutLineInfo"],
         country: str,
         channel_slug: str,
         delivery_method_info: "DeliveryMethodBase",
     ) -> None:
-        variant_ids = [line_info.variant.id for line_info in lines]
-        variants = list(
-            product_models.ProductVariant.objects.filter(
-                id__in=variant_ids
-            ).prefetch_related("product__product_type")
-        )  # FIXME: is this prefetch needed?
-        quantities = [line_info.line.quantity for line_info in lines]
+        variants = []
+        quantities = []
+        for line_info in lines:
+            variants.append(line_info.variant)
+            quantities.append(line_info.line.quantity)
         site = get_site_promise(info.context).get()
         check_lines_quantity(
             variants,
@@ -117,7 +128,9 @@ class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
         cls,
         _root,
         info,
+        /,
         shipping_address,
+        save_address,
         validation_rules=None,
         checkout_id=None,
         token=None,
@@ -129,19 +142,25 @@ class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
             checkout_id=checkout_id,
             token=token,
             id=id,
-            error_class=CheckoutErrorCode,
             qs=models.Checkout.objects.prefetch_related(
                 "lines__variant__product__product_type"
             ),
         )
+        use_legacy_error_flow_for_checkout = (
+            checkout.channel.use_legacy_error_flow_for_checkout
+        )
 
-        lines, _ = fetch_checkout_lines(checkout)
-        if not is_shipping_required(lines):
+        lines, _ = fetch_checkout_lines(
+            checkout,
+        )
+
+        # prevent from changing the shipping address when click and collect is used.
+        if checkout.collection_point_id:
             raise ValidationError(
                 {
                     "shipping_address": ValidationError(
-                        ERROR_DOES_NOT_SHIP,
-                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED,
+                        ERROR_CC_ADDRESS_CHANGE_FORBIDDEN,
+                        code=CheckoutErrorCode.SHIPPING_CHANGE_FORBIDDEN.value,
                     )
                 }
             )
@@ -157,24 +176,23 @@ class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
                 "enable_fields_normalization", True
             ),
         )
-        manager = load_plugin_manager(info.context)
-        discounts = load_discounts(info.context)
+        manager = get_plugin_manager_promise(info.context).get()
         shipping_channel_listings = checkout.channel.shipping_method_listings.all()
         checkout_info = fetch_checkout_info(
-            checkout, lines, discounts, manager, shipping_channel_listings
+            checkout, lines, manager, shipping_channel_listings
         )
 
         country = shipping_address_instance.country.code
         checkout.set_country(country, commit=True)
 
         # Resolve and process the lines, validating variants quantities
-        if lines:
+        if lines and use_legacy_error_flow_for_checkout:
             cls.process_checkout_lines(
                 info,
                 lines,
                 country,
                 checkout_info.channel.slug,
-                checkout_info.delivery_method_info,
+                checkout_info.get_delivery_method_info(),
             )
 
         update_checkout_shipping_method_if_invalid(checkout_info, lines)
@@ -185,19 +203,25 @@ class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
             shipping_address_updated_fields = change_shipping_address_in_checkout(
                 checkout_info,
                 shipping_address_instance,
+                save_address,
                 lines,
-                discounts,
-                manager,
                 shipping_channel_listings,
             )
-        invalidate_prices_updated_fields = invalidate_checkout_prices(
-            checkout_info, lines, manager, discounts, save=False
+        invalidate_prices_updated_fields = invalidate_checkout(
+            checkout_info, lines, manager, save=False
         )
         checkout.save(
             update_fields=shipping_address_updated_fields
             + invalidate_prices_updated_fields
         )
 
-        cls.call_event(manager.checkout_updated, checkout)
+        call_checkout_info_event(
+            manager,
+            event_name=WebhookEventAsyncType.CHECKOUT_UPDATED,
+            checkout_info=checkout_info,
+            lines=lines,
+        )
 
-        return CheckoutShippingAddressUpdate(checkout=checkout)
+        return CheckoutShippingAddressUpdate(
+            checkout=SyncWebhookControlContext(node=checkout)
+        )

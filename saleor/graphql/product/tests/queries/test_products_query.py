@@ -1,9 +1,11 @@
-from datetime import datetime
+import datetime
 from decimal import Decimal
 
 import graphene
+import pytest
 from django.utils.dateparse import parse_datetime
 
+from .....attribute.tests.model_helpers import get_product_attributes
 from .....core.postgres import FlatConcatSearchVector
 from .....product.models import (
     Product,
@@ -12,6 +14,7 @@ from .....product.models import (
     ProductVariantChannelListing,
 )
 from .....product.search import prepare_product_search_vector_value
+from ....core.connection import from_global_cursor
 from ....tests.utils import get_graphql_content
 
 QUERY_FETCH_ALL_PRODUCTS = """
@@ -560,12 +563,12 @@ SORT_PRODUCTS_QUERY = """
 
 
 def test_sort_products(user_api_client, product, channel_USD):
-    product.updated_at = datetime.utcnow()
+    product.updated_at = datetime.datetime.now(tz=datetime.UTC)
     product.save()
 
     product.pk = None
     product.slug = "second-product"
-    product.updated_at = datetime.utcnow()
+    product.updated_at = datetime.datetime.now(tz=datetime.UTC)
     product.save()
     ProductChannelListing.objects.create(
         product=product,
@@ -578,12 +581,13 @@ def test_sort_products(user_api_client, product, channel_USD):
         variant=variant,
         channel=channel_USD,
         price_amount=Decimal(20),
+        discounted_price_amount=Decimal(20),
         cost_price_amount=Decimal(2),
         currency=channel_USD.currency_code,
     )
     product.pk = None
     product.slug = "third-product"
-    product.updated_at = datetime.utcnow()
+    product.updated_at = datetime.datetime.now(tz=datetime.UTC)
     product.save()
     ProductChannelListing.objects.create(
         product=product,
@@ -669,13 +673,13 @@ def test_sort_products(user_api_client, product, channel_USD):
 def test_sort_products_by_price_as_staff(
     staff_api_client, product, channel_USD, permission_manage_products
 ):
-    product.updated_at = datetime.utcnow()
+    product.updated_at = datetime.datetime.now(tz=datetime.UTC)
     product.save()
     staff_api_client.user.user_permissions.add(permission_manage_products)
 
     product.pk = None
     product.slug = "second-product"
-    product.updated_at = datetime.utcnow()
+    product.updated_at = datetime.datetime.now(tz=datetime.UTC)
     product.save()
     ProductChannelListing.objects.create(
         product=product,
@@ -688,12 +692,13 @@ def test_sort_products_by_price_as_staff(
         variant=variant,
         channel=channel_USD,
         price_amount=Decimal(20),
+        discounted_price_amount=Decimal(20),
         cost_price_amount=Decimal(2),
         currency=channel_USD.currency_code,
     )
     product.pk = None
     product.slug = "third-product"
-    product.updated_at = datetime.utcnow()
+    product.updated_at = datetime.datetime.now(tz=datetime.UTC)
     product.save()
     ProductChannelListing.objects.create(
         product=product,
@@ -796,7 +801,6 @@ SEARCH_PRODUCTS_QUERY = """
 
 
 def test_search_product_by_description(user_api_client, product_list, channel_USD):
-
     variables = {"filters": {"search": "big"}, "channel": channel_USD.slug}
     response = user_api_client.post_graphql(SEARCH_PRODUCTS_QUERY, variables)
     content = get_graphql_content(response)
@@ -859,11 +863,85 @@ def test_sort_product_by_rank_without_search(
     }
     response = user_api_client.post_graphql(SEARCH_PRODUCTS_QUERY, variables)
     content = get_graphql_content(response, ignore_errors=True)
-    assert "errors" in content
-    assert (
-        content["errors"][0]["message"]
-        == "Sorting by RANK is available only when using a search filter."
+    message = (
+        "Sorting by RANK is available only when using a search filter or search "
+        "argument."
     )
+    assert "errors" in content
+    assert content["errors"][0]["message"] == message
+
+
+def test_products_query_by_rank_returns_error_with_filter_nontype_search(
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    variables = {
+        "filters": {"search": None},
+        "sortBy": {"field": "RANK", "direction": "DESC"},
+        "channel": channel_USD.slug,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        SEARCH_PRODUCTS_QUERY,
+        variables=variables,
+    )
+
+    # then
+    content = get_graphql_content(response, ignore_errors=True)
+
+    assert "errors" in content
+    errors = content["errors"]
+    expected_message = (
+        "Sorting by RANK is available only when using a search filter "
+        "or search argument."
+    )
+    assert len(errors) == 1
+    assert errors[0]["message"] == expected_message
+
+
+def test_products_query_by_rank_returns_error_with_nontype_search(
+    staff_api_client,
+    channel_USD,
+):
+    # given
+    query = """
+    query($search: String, $sortBy: ProductOrder, $channel: String) {
+      products(first: 5, search: $search, sortBy: $sortBy, channel: $channel) {
+        edges {
+          node {
+            name
+            slug
+          }
+        }
+      }
+    }
+    """
+
+    variables = {
+        "search": None,
+        "sortBy": {"field": "RANK", "direction": "DESC"},
+        "channel": channel_USD.slug,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query,
+        variables=variables,
+    )
+
+    # then
+    content = get_graphql_content(response, ignore_errors=True)
+
+    assert "errors" in content
+    errors = content["errors"]
+    expected_message = (
+        "Sorting by RANK is available only when using a search filter "
+        "or search argument."
+    )
+    assert len(errors) == 1
+    assert errors[0]["message"] == expected_message
 
 
 def test_search_product_by_description_and_name_without_sort_by(
@@ -1114,7 +1192,7 @@ def test_products_with_variants_query_as_app(
         }
     """
     product = product_with_multiple_values_attributes
-    attribute = product.attributes.first().attribute
+    attribute = get_product_attributes(product).first()
     attribute.visible_in_storefront = False
     attribute.save()
     second_product = product
@@ -1133,3 +1211,203 @@ def test_products_with_variants_query_as_app(
         attrs = response_product["node"]["attributes"]
         assert len(attrs) == 1
         assert attrs[0]["attribute"]["id"] == attribute_id
+
+
+PRODUCT_SEARCH_QUERY = """
+    query($search: String, $channel: String, $first: Int, $after: String, $sortBy: ProductOrder) {
+      products(
+        first: $first,
+        search: $search,
+        channel: $channel,
+        after: $after,
+        sortBy: $sortBy
+      ) {
+        pageInfo{
+          endCursor
+        }
+        edges {
+          cursor
+          node {
+            name
+            slug
+          }
+        }
+      }
+    }
+"""
+
+
+@pytest.mark.parametrize(
+    ("search", "indexes"),
+    [
+        ("small", [2]),
+        ("big", [0, 1]),
+        ("product", [0, 1, 2]),
+        ("ABCD", []),
+        (None, [0, 1, 2]),
+        ("", [0, 1, 2]),
+    ],
+)
+def test_search_products_on_root_level(
+    search, indexes, api_client, product_list, channel_USD
+):
+    # given
+    variables = {"search": search, "channel": channel_USD.slug, "first": 10}
+
+    # when
+    response = api_client.post_graphql(PRODUCT_SEARCH_QUERY, variables)
+
+    # then
+    data = get_graphql_content(response)
+    nodes = data["data"]["products"]["edges"]
+    assert len(nodes) == len(indexes)
+    returned_attrs = {node["node"]["slug"] for node in nodes}
+    assert returned_attrs == {product_list[index].slug for index in indexes}
+
+
+def test_search_product_using_search_argument_with_sort_by(
+    user_api_client, product_list, product, channel_USD
+):
+    product.description_plaintext = "new big new product"
+
+    product_2 = product_list[1]
+    product_2.name = "new product"
+    product_1 = product_list[0]
+    product_1.description_plaintext = "some new product"
+
+    product_list.append(product)
+    for prod in product_list:
+        prod.search_vector = FlatConcatSearchVector(
+            *prepare_product_search_vector_value(prod)
+        )
+
+    Product.objects.bulk_update(
+        product_list,
+        ["search_vector", "name", "description_plaintext"],
+    )
+
+    variables = {
+        "search": "new",
+        "sortBy": {"field": "RANK", "direction": "DESC"},
+        "first": 10,
+        "channel": channel_USD.slug,
+    }
+    response = user_api_client.post_graphql(PRODUCT_SEARCH_QUERY, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["products"]["edges"]
+
+    assert len(data) == 3
+    assert {node["node"]["name"] for node in data} == {
+        product.name,
+        product_1.name,
+        product_2.name,
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "sort_order",
+        "reversed",
+    ),
+    [
+        (
+            "ASC",
+            False,
+        ),
+        ("DESC", True),
+    ],
+)
+def test_search_product_with_similar_search_rank_and_cursor_usage(
+    sort_order, reversed, user_api_client, product_list, channel_USD
+):
+    # given
+    sorted_products = sorted(
+        product_list, key=lambda product: product.id, reverse=reversed
+    )
+    product_1 = sorted_products[0]
+    product_1.description_plaintext = "Orange"
+    product_2 = sorted_products[1]
+    product_2.description_plaintext = "Orange"
+    product_3 = sorted_products[2]
+    product_3.description_plaintext = "Orange"
+
+    for product in product_list:
+        product.search_vector = FlatConcatSearchVector(
+            *prepare_product_search_vector_value(product)
+        )
+
+    Product.objects.bulk_update(
+        product_list,
+        ["search_vector", "description_plaintext"],
+    )
+
+    variables = {
+        "search": "Orange",
+        "sortBy": {"field": "RANK", "direction": sort_order},
+        "first": 1,
+        "channel": channel_USD.slug,
+    }
+
+    # when
+    response = user_api_client.post_graphql(PRODUCT_SEARCH_QUERY, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["products"]["edges"]
+
+    assert len(data) == 1
+    assert data[0]["node"]["name"] == product_1.name
+
+    cursor = content["data"]["products"]["pageInfo"]["endCursor"]
+
+    variables = {
+        "search": "Orange",
+        "sortBy": {"field": "RANK", "direction": sort_order},
+        "first": 2,
+        "channel": channel_USD.slug,
+        "after": cursor,
+    }
+    response = user_api_client.post_graphql(PRODUCT_SEARCH_QUERY, variables)
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["products"]["edges"]
+    assert len(data) == 2
+    assert data[0]["node"]["name"] == product_2.name
+    assert data[1]["node"]["name"] == product_3.name
+
+
+def test_search_product_sort_by_attribute_returns_correct_cursor(
+    user_api_client, product, channel_USD
+):
+    # given
+    attribute = product.product_type.product_attributes.first()
+    attr_value = attribute.values.first()
+
+    product.description_plaintext = "Orange"
+
+    product.search_vector = FlatConcatSearchVector(
+        *prepare_product_search_vector_value(product)
+    )
+    product.save()
+
+    variables = {
+        "search": "Orange",
+        "sortBy": {
+            "attributeId": graphene.Node.to_global_id("Attribute", attribute.id),
+            "direction": "ASC",
+        },
+        "first": 1,
+        "channel": channel_USD.slug,
+    }
+
+    # when
+    response = user_api_client.post_graphql(PRODUCT_SEARCH_QUERY, variables)
+
+    # then
+    content = get_graphql_content(response)
+    cursor = content["data"]["products"]["pageInfo"]["endCursor"]
+    cursor_data = from_global_cursor(cursor)
+
+    # Ref saleor.product.managers.ProductsQueryset.sort_by_attribute
+    # First field stores the flag to determine if product has assigned attribute values
+    # Second is the list of attribute values as string
+    assert ["0", attr_value.name, product.name] == cursor_data
